@@ -309,7 +309,7 @@ async def test_concurrent_workers_only_one_claims_job(db_session):
         assert claimed_job.worker_id in ["worker-1", "worker-2"]
         
         # Verify database state using original session
-        await db_session.expire_all()
+        db_session.expire_all()  # Synchronous method - do not await
         result = await db_session.execute(select(Job).where(Job.id == job_id))
         db_job = result.scalar_one()
         assert db_job.status == JobStatus.PROCESSING
@@ -328,7 +328,10 @@ async def test_concurrent_workers_only_one_claims_job(db_session):
 async def test_concurrent_claims_on_multiple_jobs(db_session):
     """
     Test that multiple workers can claim different jobs simultaneously without conflict.
+    Each worker uses its own independent AsyncSession.
     """
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    
     # Create multiple queued jobs
     jobs = []
     for i in range(5):
@@ -347,29 +350,61 @@ async def test_concurrent_claims_on_multiple_jobs(db_session):
     for job in jobs:
         await db_session.refresh(job)
     
-    # Create services - all using the same session is fine for different jobs
-    mock_redis = RedisClient()
-    job_service = JobService(db_session, mock_redis, QueueService(mock_redis))
+    # Create independent sessions for each worker
+    TEST_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/jobprocessing_test"
+    engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+    SessionFactory = async_sessionmaker(engine, expire_on_commit=False)
     
-    # Each worker tries to claim a different job
-    tasks = [
-        job_service.claim_job(jobs[0].id, "worker-1"),
-        job_service.claim_job(jobs[1].id, "worker-2"),
-        job_service.claim_job(jobs[2].id, "worker-3"),
-        job_service.claim_job(jobs[3].id, "worker-4"),
-        job_service.claim_job(jobs[4].id, "worker-5"),
-    ]
+    sessions = [SessionFactory() for _ in range(5)]
     
-    results = await asyncio.gather(*tasks)
-    await db_session.commit()
+    async def worker_claim_job(session, job_id, worker_id):
+        """Each worker claims with its own session"""
+        try:
+            mock_redis = RedisClient()
+            job_service = JobService(session, mock_redis, QueueService(mock_redis))
+            
+            claimed_job = await job_service.claim_job(job_id, worker_id)
+            
+            if claimed_job:
+                await session.commit()
+                return claimed_job
+            else:
+                await session.rollback()
+                return None
+        except Exception as e:
+            await session.rollback()
+            return None
     
-    # Verify all claims succeeded
-    assert all(r is not None for r in results)
-    assert len(results) == 5
-    
-    # Verify each job claimed by different worker
-    worker_ids = {r.worker_id for r in results}
-    assert len(worker_ids) == 5  # All different workers
+    try:
+        # Each worker tries to claim a different job with its own session
+        tasks = [
+            worker_claim_job(sessions[0], jobs[0].id, "worker-1"),
+            worker_claim_job(sessions[1], jobs[1].id, "worker-2"),
+            worker_claim_job(sessions[2], jobs[2].id, "worker-3"),
+            worker_claim_job(sessions[3], jobs[3].id, "worker-4"),
+            worker_claim_job(sessions[4], jobs[4].id, "worker-5"),
+        ]
+        
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks),
+            timeout=5.0  # 5 second timeout
+        )
+        
+        # Verify all claims succeeded
+        assert all(r is not None for r in results)
+        assert len(results) == 5
+        
+        # Verify each job claimed by different worker
+        worker_ids = {r.worker_id for r in results}
+        assert len(worker_ids) == 5  # All different workers
+        
+    except asyncio.TimeoutError:
+        pytest.fail("Test timed out - possible deadlock in concurrent claims")
+    finally:
+        # Clean up all sessions
+        for session in sessions:
+            await session.close()
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
