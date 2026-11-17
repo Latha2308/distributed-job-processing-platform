@@ -1,0 +1,27 @@
+Generic single-database configuration for Alembic.
+
+This is used for database migrations in the Distributed Job Processing Platform.
+
+## Create a migration
+
+```bash
+alembic revision --autogenerate -m "description of changes"
+```
+
+## Apply migrations
+
+```bash
+alembic upgrade head
+```
+
+## Rollback migration
+
+```bash
+alembic downgrade -1
+```
+
+## View migration history
+
+```bash
+alembic history
+```

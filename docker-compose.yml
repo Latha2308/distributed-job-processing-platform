@@ -1,0 +1,123 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: jobprocessing-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: jobprocessing
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: jobprocessing-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: jobprocessing-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/jobprocessing
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in your .env file}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: jobprocessing-worker1
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/jobprocessing
+      - REDIS_URL=redis://redis:6379/0
+      - WORKER_ID=worker-1
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in your .env file}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+  worker2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: jobprocessing-worker2
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/jobprocessing
+      - REDIS_URL=redis://redis:6379/0
+      - WORKER_ID=worker-2
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in your .env file}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+  worker3:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: jobprocessing-worker3
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/jobprocessing
+      - REDIS_URL=redis://redis:6379/0
+      - WORKER_ID=worker-3
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in your .env file}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: jobprocessing-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
