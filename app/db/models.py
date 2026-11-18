@@ -176,3 +176,33 @@ class WorkerHeartbeat(Base):
 
     def __repr__(self) -> str:
         return f"<WorkerHeartbeat(worker_id={self.worker_id}, active={self.is_active})>"
+
+
+class JobOutbox(Base):
+    """Transactional outbox for reliable job event publishing"""
+
+    __tablename__ = "job_outbox"
+
+    # Primary key
+    id: Mapped[PythonUUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+
+    # Job reference
+    job_id: Mapped[PythonUUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+
+    # Event tracking
+    event_type: Mapped[str] = mapped_column(String(50), default="job_created", nullable=False)
+    published: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # Error tracking
+    last_error: Mapped[Optional[str]] = mapped_column(Text)
+
+    # Composite index for efficient polling
+    __table_args__ = (Index("idx_outbox_published_created", "published", "created_at"),)
+
+    def __repr__(self) -> str:
+        return f"<JobOutbox(id={self.id}, job_id={self.job_id}, event_type={self.event_type}, published={self.published})>"

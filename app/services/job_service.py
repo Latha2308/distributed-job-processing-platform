@@ -13,12 +13,11 @@ from app.core.metrics import (
     job_submissions,
     job_completions,
     job_processing_duration,
-    queue_depth,
     job_retries,
     job_failures,
 )
 from app.core.redis_client import RedisClient
-from app.db.models import Job, JobExecution, JobStatus
+from app.db.models import Job, JobExecution, JobStatus, JobOutbox
 from app.models.job import JobCreate, JobUpdate, JobStats, JobMetrics
 from app.services.queue_service import QueueService
 
@@ -40,7 +39,12 @@ class JobService:
 
     async def create_job(self, job_data: JobCreate) -> Job:
         """
-        Create a new job and enqueue it.
+        Create a new job with transactional outbox pattern.
+
+        Creates both Job and JobOutbox records in the same transaction.
+        The outbox dispatcher will asynchronously publish to Redis.
+
+        Transaction is managed by the caller (get_db dependency).
 
         Args:
             job_data: Job creation data
@@ -51,7 +55,7 @@ class JobService:
         Raises:
             ValueError: If idempotency key already exists
         """
-        # Check idempotency
+        # Check idempotency - return existing job WITHOUT creating new outbox event
         if job_data.idempotency_key:
             existing = await self._get_job_by_idempotency_key(job_data.idempotency_key)
             if existing:
@@ -77,23 +81,25 @@ class JobService:
         await self.db.flush()
         await self.db.refresh(job)
 
-        # Enqueue job
-        await self.queue_service.enqueue_job(
+        # Create outbox event in same transaction
+        outbox_event = JobOutbox(
             job_id=job.id,
-            job_type=job.job_type,
-            priority=job.priority if job.priority is not None else 0,
+            event_type="job_created",
+            published=False,
+            attempts=0,
         )
+
+        self.db.add(outbox_event)
+        await self.db.flush()
+        await self.db.refresh(outbox_event)
 
         # Update metrics
         job_submissions.labels(job_type=job.job_type, priority=str(job.priority)).inc()
 
-        # Update queue depth metric
-        depth = await self.queue_service.get_queue_depth()
-        queue_depth.labels(priority=str(job.priority)).set(depth)
-
         logger.info(
-            "job_created",
+            "job_created_with_outbox",
             job_id=str(job.id),
+            outbox_event_id=str(outbox_event.id),
             job_type=job.job_type,
             priority=job.priority,
         )

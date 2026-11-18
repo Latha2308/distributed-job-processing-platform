@@ -33,9 +33,25 @@ class RedisClient:
         return self._client
 
     async def close(self):
-        """Close Redis connection"""
+        """Close Redis connection and disconnect pool connections.
+
+        Safe to call multiple times. Closes the client and disconnects
+        all connections in the shared pool to prevent event loop errors.
+        """
         if self._client:
-            await self._client.aclose()  # Use aclose() instead of deprecated close()
+            try:
+                await self._client.aclose()
+            except Exception as e:
+                logger.error(f"Error closing Redis client: {e}")
+            finally:
+                self._client = None
+
+        # Disconnect all connections in the pool to prevent
+        # "Event loop is closed" errors during shutdown
+        try:
+            await redis_pool.disconnect()
+        except Exception as e:
+            logger.error(f"Error disconnecting Redis pool: {e}")
 
     async def set_json(self, key: str, value: Any, expire: Optional[int] = None) -> bool:
         """Store JSON data in Redis"""

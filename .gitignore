@@ -79,3 +79,7 @@ alembic/versions/*.pyc
 # Local development copies
 app/core/redis_client_copy.py
 app/worker/job_executor.py.proposed
+
+# Generated schema snapshots
+before.json
+after.json
