@@ -3,7 +3,7 @@
 from typing import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
 
@@ -25,14 +25,18 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False,
 )
 
-# Create declarative base
-Base = declarative_base()
+
+# Create declarative base for SQLAlchemy 2.0 typed mappings
+class Base(DeclarativeBase):
+    """Base class for all ORM models with type support"""
+
+    pass
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
     Dependency for getting async database sessions.
-    
+
     Yields:
         AsyncSession: Database session
     """
@@ -52,6 +56,6 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         # Import all models to ensure they're registered
         from app.db import models  # noqa: F401
-        
+
         # Create all tables
         await conn.run_sync(Base.metadata.create_all)

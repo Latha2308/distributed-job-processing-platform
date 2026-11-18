@@ -2,7 +2,8 @@
 
 import logging
 import sys
-from typing import Any
+from collections.abc import Callable
+from typing import Any, cast
 
 import structlog
 
@@ -12,7 +13,7 @@ from app.core.config import settings
 def setup_logging() -> structlog.BoundLogger:
     """
     Configure structured logging with structlog.
-    
+
     Returns:
         BoundLogger: Configured logger instance
     """
@@ -22,21 +23,21 @@ def setup_logging() -> structlog.BoundLogger:
         stream=sys.stdout,
         level=getattr(logging, settings.LOG_LEVEL.upper()),
     )
-    
+
     # Configure structlog processors
-    processors = [
+    processors: list[Callable[..., Any]] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
     ]
-    
+
     # Add JSON renderer for production, console renderer for development
     if settings.LOG_FORMAT == "json":
         processors.append(structlog.processors.JSONRenderer())
     else:
         processors.append(structlog.dev.ConsoleRenderer())
-    
+
     # Configure structlog
     structlog.configure(
         processors=processors,
@@ -47,15 +48,17 @@ def setup_logging() -> structlog.BoundLogger:
         logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,
     )
-    
-    return structlog.get_logger()
+
+    return cast(structlog.BoundLogger, structlog.get_logger())
 
 
 def log_execution_time(logger: structlog.BoundLogger):
     """Decorator to log function execution time"""
+
     def decorator(func):
         async def async_wrapper(*args, **kwargs):
             import time
+
             start = time.time()
             try:
                 result = await func(*args, **kwargs)
@@ -75,9 +78,10 @@ def log_execution_time(logger: structlog.BoundLogger):
                     error=str(e),
                 )
                 raise
-        
+
         def sync_wrapper(*args, **kwargs):
             import time
+
             start = time.time()
             try:
                 result = func(*args, **kwargs)
@@ -97,10 +101,11 @@ def log_execution_time(logger: structlog.BoundLogger):
                     error=str(e),
                 )
                 raise
-        
+
         import asyncio
+
         if asyncio.iscoroutinefunction(func):
             return async_wrapper
         return sync_wrapper
-    
+
     return decorator

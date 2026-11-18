@@ -15,25 +15,21 @@ def get_worker_service(db: AsyncSession = Depends(get_db)) -> WorkerService:
     return WorkerService(db)
 
 
-@router.get(
-    "/",
-    response_model=WorkerListResponse,
-    summary="List all workers"
-)
+@router.get("/", response_model=WorkerListResponse, summary="List all workers")
 async def list_workers(
     active_only: bool = False,
     service: WorkerService = Depends(get_worker_service),
 ):
     """
     List all workers.
-    
+
     - **active_only**: Only return active workers
     """
     workers = await service.list_workers(active_only=active_only)
-    
+
     active_count = sum(1 for w in workers if w.is_active)
     inactive_count = len(workers) - active_count
-    
+
     return WorkerListResponse(
         workers=[WorkerStatus.model_validate(w) for w in workers],
         total_active=active_count,
@@ -41,11 +37,7 @@ async def list_workers(
     )
 
 
-@router.get(
-    "/{worker_id}",
-    response_model=WorkerStatus,
-    summary="Get worker by ID"
-)
+@router.get("/{worker_id}", response_model=WorkerStatus, summary="Get worker by ID")
 async def get_worker(
     worker_id: str,
     service: WorkerService = Depends(get_worker_service),
@@ -54,17 +46,12 @@ async def get_worker(
     worker = await service.get_worker(worker_id)
     if not worker:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Worker {worker_id} not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Worker {worker_id} not found"
         )
     return WorkerStatus.model_validate(worker)
 
 
-@router.get(
-    "/metrics/overview",
-    response_model=WorkerMetrics,
-    summary="Get worker metrics"
-)
+@router.get("/metrics/overview", response_model=WorkerMetrics, summary="Get worker metrics")
 async def get_worker_metrics(
     service: WorkerService = Depends(get_worker_service),
 ):
@@ -72,16 +59,10 @@ async def get_worker_metrics(
     return await service.get_worker_metrics()
 
 
-@router.post(
-    "/cleanup",
-    summary="Mark stale workers as inactive"
-)
+@router.post("/cleanup", summary="Mark stale workers as inactive")
 async def cleanup_stale_workers(
     service: WorkerService = Depends(get_worker_service),
 ):
     """Mark workers with stale heartbeats as inactive"""
     count = await service.mark_stale_workers_inactive()
-    return {
-        "message": f"Marked {count} stale workers as inactive",
-        "count": count
-    }
+    return {"message": f"Marked {count} stale workers as inactive", "count": count}

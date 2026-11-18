@@ -23,9 +23,9 @@ async def lifespan(app: FastAPI):
     logger.info("Starting application", version=settings.APP_VERSION)
     await init_db()
     logger.info("Database initialized")
-    
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down application")
 
@@ -74,13 +74,13 @@ async def health_check():
         content={
             "status": "healthy",
             "version": settings.APP_VERSION,
-        }
+        },
     )
 
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",

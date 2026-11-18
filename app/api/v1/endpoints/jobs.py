@@ -34,10 +34,7 @@ def get_job_service(
 
 
 @router.post(
-    "/",
-    response_model=JobResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create a new job"
+    "/", response_model=JobResponse, status_code=status.HTTP_201_CREATED, summary="Create a new job"
 )
 async def create_job(
     job_data: JobCreate,
@@ -45,7 +42,7 @@ async def create_job(
 ):
     """
     Create a new job and enqueue it for processing.
-    
+
     - **job_type**: Type of job to execute
     - **payload**: Job data as JSON
     - **priority**: Priority level (0=highest, 10=lowest)
@@ -57,11 +54,7 @@ async def create_job(
     return JobResponse.model_validate(job)
 
 
-@router.get(
-    "/{job_id}",
-    response_model=JobResponse,
-    summary="Get job by ID"
-)
+@router.get("/{job_id}", response_model=JobResponse, summary="Get job by ID")
 async def get_job(
     job_id: UUID,
     service: JobService = Depends(get_job_service),
@@ -69,18 +62,11 @@ async def get_job(
     """Get job details by ID"""
     job = await service.get_job(job_id)
     if not job:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Job {job_id} not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job {job_id} not found")
     return JobResponse.model_validate(job)
 
 
-@router.get(
-    "/",
-    response_model=JobListResponse,
-    summary="List jobs"
-)
+@router.get("/", response_model=JobListResponse, summary="List jobs")
 async def list_jobs(
     status_filter: Optional[JobStatus] = Query(None, alias="status"),
     job_type: Optional[str] = Query(None),
@@ -90,7 +76,7 @@ async def list_jobs(
 ):
     """
     List jobs with optional filters and pagination.
-    
+
     - **status**: Filter by job status
     - **job_type**: Filter by job type
     - **page**: Page number (starts at 1)
@@ -102,7 +88,7 @@ async def list_jobs(
         page=page,
         page_size=page_size,
     )
-    
+
     return JobListResponse(
         items=[JobResponse.model_validate(job) for job in jobs],
         total=total,
@@ -112,11 +98,7 @@ async def list_jobs(
     )
 
 
-@router.patch(
-    "/{job_id}",
-    response_model=JobResponse,
-    summary="Update job status"
-)
+@router.patch("/{job_id}", response_model=JobResponse, summary="Update job status")
 async def update_job(
     job_id: UUID,
     update_data: JobUpdate,
@@ -125,41 +107,27 @@ async def update_job(
     """Update job status and result"""
     job = await service.update_job_status(job_id, update_data)
     if not job:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Job {job_id} not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job {job_id} not found")
     return JobResponse.model_validate(job)
 
 
-@router.post(
-    "/{job_id}/retry",
-    response_model=JobResponse,
-    summary="Retry a failed job"
-)
+@router.post("/{job_id}/retry", response_model=JobResponse, summary="Retry a failed job")
 async def retry_job(
     job_id: UUID,
     service: JobService = Depends(get_job_service),
 ):
     """
     Retry a failed job.
-    
+
     If the job has reached max retries, it will be moved to the dead letter queue.
     """
     job = await service.retry_job(job_id)
     if not job:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Job {job_id} not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job {job_id} not found")
     return JobResponse.model_validate(job)
 
 
-@router.get(
-    "/stats/overview",
-    response_model=JobStats,
-    summary="Get job statistics"
-)
+@router.get("/stats/overview", response_model=JobStats, summary="Get job statistics")
 async def get_job_stats(
     service: JobService = Depends(get_job_service),
 ):
@@ -167,11 +135,7 @@ async def get_job_stats(
     return await service.get_job_stats()
 
 
-@router.get(
-    "/metrics/by-type",
-    response_model=list[JobMetrics],
-    summary="Get metrics by job type"
-)
+@router.get("/metrics/by-type", response_model=list[JobMetrics], summary="Get metrics by job type")
 async def get_metrics_by_type(
     service: JobService = Depends(get_job_service),
 ):

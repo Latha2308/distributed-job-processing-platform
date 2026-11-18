@@ -2,7 +2,7 @@
 
 import json
 import time
-from typing import Any, Optional
+from typing import Any, Optional, cast, Awaitable
 
 import redis.asyncio as aioredis
 from redis.asyncio import ConnectionPool
@@ -18,6 +18,7 @@ redis_pool = ConnectionPool.from_url(
     max_connections=settings.REDIS_POOL_SIZE,
     decode_responses=True,
 )
+
 
 class RedisClient:
     """Redis client wrapper"""
@@ -41,8 +42,8 @@ class RedisClient:
         client = await self.get_client()
         data = json.dumps(value)
         if expire:
-            return await client.setex(key, expire, data)
-        return await client.set(key, data)
+            return bool(await client.setex(key, expire, data))
+        return bool(await client.set(key, data))
 
     async def get_json(self, key: str) -> Optional[Any]:
         """Retrieve JSON data from Redis"""
@@ -55,12 +56,12 @@ class RedisClient:
     async def delete(self, key: str) -> bool:
         """Delete key from Redis"""
         client = await self.get_client()
-        return await client.delete(key) > 0
+        return bool((await client.delete(key)) > 0)
 
     async def exists(self, key: str) -> bool:
         """Check if key exists"""
         client = await self.get_client()
-        return await client.exists(key) > 0
+        return bool((await client.exists(key)) > 0)
 
     async def push_to_queue(self, queue_name: str, item: Any, priority: int = 0) -> bool:
         """
@@ -74,7 +75,7 @@ class RedisClient:
         # FIXED: Use priority directly as score (was -priority which caused reverse ordering)
         # ZADD returns number of elements added (0 if element existed and was updated)
         # Both 0 and 1 indicate success
-        return await client.zadd(queue_name, {data: priority}) >= 0
+        return bool((await client.zadd(queue_name, {data: priority})) >= 0)
 
     async def pop_from_queue(self, queue_name: str) -> Optional[Any]:
         """Pop item from priority queue"""
@@ -89,15 +90,81 @@ class RedisClient:
     async def queue_length(self, queue_name: str) -> int:
         """Get queue length"""
         client = await self.get_client()
-        return await client.zcard(queue_name)
+        return int(await client.zcard(queue_name))
 
     # ========== DELAYED QUEUE METHODS ==========
 
+    def _validate_job_data_fields(self, job_data: dict) -> bool:
+        """Validate required fields in job_data. Returns True if valid."""
+        required_fields = ["job_id", "job_type", "priority"]
+        missing_fields = [f for f in required_fields if f not in job_data]
+        if missing_fields:
+            logger.error(
+                "push_to_delayed_queue_validation_failed",
+                missing_fields=missing_fields,
+                job_data_keys=list(job_data.keys()),
+            )
+            return False
+        return True
+
+    def _validate_priority(self, priority) -> bool:
+        """Validate priority value. Returns True if valid."""
+        # Reject boolean values for priority (bool is subclass of int in Python)
+        if isinstance(priority, bool):
+            logger.error("priority_is_boolean", priority=priority, required="integer 0-10")
+            return False
+
+        # Validate priority is integer in range 0-10
+        if not isinstance(priority, int) or priority < 0 or priority > 10:
+            logger.error(
+                "invalid_priority",
+                priority=priority,
+                priority_type=type(priority).__name__,
+                valid_range="0-10 (integer)",
+            )
+            return False
+        return True
+
+    def _validate_and_convert_execute_at(
+        self, execute_at: float, job_data: dict
+    ) -> tuple[bool, float]:
+        """
+        Validate and convert execute_at timestamp.
+        Returns (is_valid, execute_at_time).
+        """
+        try:
+            execute_at_time = float(execute_at)
+
+            # Reject NaN
+            if execute_at_time != execute_at_time:  # NaN check (NaN != NaN)
+                logger.error("execute_at_is_nan", execute_at=execute_at)
+                return False, 0.0
+
+            # Reject infinity
+            if execute_at_time == float("inf") or execute_at_time == float("-inf"):
+                logger.error("execute_at_is_infinity", execute_at=execute_at)
+                return False, 0.0
+
+            # Warn if in the past (but allow it)
+            if execute_at_time < time.time():
+                logger.warning(
+                    "execute_at_in_past", execute_at=execute_at_time, current_time=time.time()
+                )
+
+            return True, execute_at_time
+
+        except (ValueError, TypeError) as e:
+            # CRITICAL: Must log BOTH priority and execute_at for debugging
+            logger.error(
+                "invalid_numeric_field",
+                error=str(e),
+                priority=job_data.get("priority"),
+                execute_at=execute_at,
+            )
+            return False, 0.0
+
     async def push_to_delayed_queue(
-        self,
-        job_data: dict,
-        execute_at: float,
-        queue_name: str = "job_queue_delayed"
+        self, job_data: dict, execute_at: float, queue_name: str = "job_queue_delayed"
     ) -> bool:
         """
         Push a job to the delayed queue with execute_at timestamp as score.
@@ -111,69 +178,19 @@ class RedisClient:
             True if added successfully, False on validation failure
         """
         # Validate required fields
-        required_fields = ["job_id", "job_type", "priority"]
-        missing_fields = [f for f in required_fields if f not in job_data]
-        if missing_fields:
-            logger.error(
-                "push_to_delayed_queue_validation_failed",
-                missing_fields=missing_fields,
-                job_data_keys=list(job_data.keys())
-            )
+        if not self._validate_job_data_fields(job_data):
             return False
 
-        # Validate types and ranges
-        try:
-            priority = job_data["priority"]
-
-            # Reject boolean values for priority (bool is subclass of int in Python)
-            if isinstance(priority, bool):
-                logger.error(
-                    "priority_is_boolean",
-                    priority=priority,
-                    required="integer 0-10"
-                )
-                return False
-
-            # Validate priority is integer in range 0-10
-            if not isinstance(priority, int) or priority < 0 or priority > 10:
-                logger.error(
-                    "invalid_priority",
-                    priority=priority,
-                    priority_type=type(priority).__name__,
-                    valid_range="0-10 (integer)"
-                )
-                return False
-
-            # Validate execute_at and reject NaN/infinity
-            execute_at_time = float(execute_at)
-
-            # Reject NaN
-            if execute_at_time != execute_at_time:  # NaN check (NaN != NaN)
-                logger.error("execute_at_is_nan", execute_at=execute_at)
-                return False
-
-            # Reject infinity
-            if execute_at_time == float('inf') or execute_at_time == float('-inf'):
-                logger.error("execute_at_is_infinity", execute_at=execute_at)
-                return False
-
-            # Warn if in the past (but allow it)
-            if execute_at_time < time.time():
-                logger.warning(
-                    "execute_at_in_past",
-                    execute_at=execute_at_time,
-                    current_time=time.time()
-                )
-
-        except (ValueError, TypeError) as e:
-            logger.error(
-                "invalid_numeric_field",
-                error=str(e),
-                priority=job_data.get("priority"),
-                execute_at=execute_at
-            )
+        # Validate priority
+        if not self._validate_priority(job_data["priority"]):
             return False
 
+        # Validate execute_at (pass job_data for error logging)
+        is_valid, execute_at_time = self._validate_and_convert_execute_at(execute_at, job_data)
+        if not is_valid:
+            return False
+
+        # Add to queue
         try:
             client = await self.get_client()
             job_json = json.dumps(job_data)
@@ -184,10 +201,10 @@ class RedisClient:
                 job_id=job_data["job_id"],
                 execute_at=execute_at_time,
                 delay_seconds=round(execute_at_time - time.time(), 2),
-                queue_name=queue_name
+                queue_name=queue_name,
             )
 
-            return result >= 0  # 0 or 1 both indicate success
+            return bool(result >= 0)  # 0 or 1 both indicate success
 
         except Exception as e:
             logger.error(
@@ -195,7 +212,7 @@ class RedisClient:
                 error=str(e),
                 error_type=type(e).__name__,
                 job_id=job_data.get("job_id"),
-                queue_name=queue_name
+                queue_name=queue_name,
             )
             return False
 
@@ -204,7 +221,7 @@ class RedisClient:
         main_queue: str = "job_queue",
         delayed_queue: str = "job_queue_delayed",
         batch_limit: int = 100,
-        quarantine_queue: str = "job_queue_invalid"
+        quarantine_queue: str = "job_queue_invalid",
     ) -> int:
         """
         Atomically transfer ready jobs from delayed queue to main queue using Lua.
@@ -248,7 +265,7 @@ class RedisClient:
                 "invalid_batch_limit",
                 batch_limit=batch_limit,
                 batch_limit_type=type(batch_limit).__name__,
-                required="integer >= 1"
+                required="integer >= 1",
             )
             raise ValueError(f"batch_limit must be integer >= 1, got {batch_limit}")
 
@@ -358,14 +375,17 @@ class RedisClient:
             client = await self.get_client()
 
             # Execute Lua script atomically on Redis server
-            result = await client.eval(
-                lua_script,
-                3,  # number of keys
-                delayed_queue,
-                main_queue,
-                quarantine_queue,
-                current_time,
-                enforced_limit
+            result = await cast(
+                Awaitable[Any],
+                client.eval(
+                    lua_script,
+                    3,  # number of keys
+                    delayed_queue,
+                    main_queue,
+                    quarantine_queue,
+                    str(current_time),
+                    str(enforced_limit),
+                ),
             )
 
             transferred, quarantined = result
@@ -375,7 +395,7 @@ class RedisClient:
                     "delayed_jobs_transferred",
                     count=transferred,
                     from_queue=delayed_queue,
-                    to_queue=main_queue
+                    to_queue=main_queue,
                 )
 
             if quarantined > 0:
@@ -383,7 +403,7 @@ class RedisClient:
                     "invalid_jobs_quarantined",
                     count=quarantined,
                     quarantine_queue=quarantine_queue,
-                    action_required="Investigate quarantined jobs"
+                    action_required="Investigate quarantined jobs",
                 )
 
             return int(transferred)
@@ -395,7 +415,7 @@ class RedisClient:
                 error_type=type(e).__name__,
                 delayed_queue=delayed_queue,
                 main_queue=main_queue,
-                impact="Partial transfers may have occurred before error"
+                impact="Partial transfers may have occurred before error",
             )
             # Raise error - do NOT fall back to unsafe Python implementation
             raise RuntimeError(f"Atomic delayed job transfer failed: {e}") from e
@@ -403,7 +423,7 @@ class RedisClient:
     async def delayed_queue_length(self, queue_name: str = "job_queue_delayed") -> int:
         """Get total count of jobs in delayed queue"""
         client = await self.get_client()
-        return await client.zcard(queue_name)
+        return int(await client.zcard(queue_name))
 
     async def get_delayed_queue_ready_count(self, queue_name: str = "job_queue_delayed") -> int:
         """
@@ -413,12 +433,10 @@ class RedisClient:
         """
         client = await self.get_client()
         current_time = time.time()
-        return await client.zcount(queue_name, 0, current_time)
+        return int(await client.zcount(queue_name, 0, current_time))
 
     async def peek_delayed_queue(
-        self,
-        queue_name: str = "job_queue_delayed",
-        limit: int = 10
+        self, queue_name: str = "job_queue_delayed", limit: int = 10
     ) -> list:
         """
         Peek at jobs in the delayed queue without removing them.
@@ -436,10 +454,7 @@ class RedisClient:
                     job_data = json.loads(job_json)
                     result.append((job_data, execute_at))
                 except json.JSONDecodeError:
-                    logger.debug(
-                        "invalid_json_during_peek",
-                        job_json_preview=job_json[:100]
-                    )
+                    logger.debug("invalid_json_during_peek", job_json_preview=job_json[:100])
                     continue
 
             return result
@@ -487,7 +502,7 @@ class RedisClient:
             logger.info(
                 "redis_connectivity_verified",
                 **stats,
-                redis_url=str(settings.REDIS_URL).split("@")[-1]  # Hide credentials
+                redis_url=str(settings.REDIS_URL).split("@")[-1],  # Hide credentials
             )
 
             # Warn about unexpected states
@@ -496,14 +511,14 @@ class RedisClient:
                     "unexpected_main_queue_type",
                     expected="zset or none",
                     actual=main_queue_type,
-                    action_required="Clear or migrate job_queue"
+                    action_required="Clear or migrate job_queue",
                 )
 
             if quarantine_len > 0:
                 logger.warning(
                     "quarantine_queue_not_empty",
                     count=quarantine_len,
-                    action_required="Investigate job_queue_invalid"
+                    action_required="Investigate job_queue_invalid",
                 )
 
             return stats
@@ -513,12 +528,14 @@ class RedisClient:
                 "redis_connectivity_failed",
                 error=str(e),
                 error_type=type(e).__name__,
-                redis_url=str(settings.REDIS_URL).split("@")[-1]
+                redis_url=str(settings.REDIS_URL).split("@")[-1],
             )
             return {"connected": False, "error": str(e)}
 
+
 # Global Redis client instance
 redis_client = RedisClient()
+
 
 async def get_redis() -> RedisClient:
     """Dependency for getting Redis client"""

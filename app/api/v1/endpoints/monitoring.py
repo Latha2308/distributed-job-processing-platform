@@ -1,6 +1,7 @@
 """Monitoring endpoints"""
 
 from fastapi import APIRouter, Depends
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -28,13 +29,13 @@ async def get_dashboard(
     queue_service = QueueService(redis)
     job_service = JobService(db, redis, queue_service)
     worker_service = WorkerService(db)
-    
+
     # Gather metrics
     job_stats = await job_service.get_job_stats()
     job_metrics = await job_service.get_job_metrics_by_type()
     worker_metrics = await worker_service.get_worker_metrics()
     queue_depth = await queue_service.get_queue_depth()
-    
+
     return {
         "job_stats": job_stats,
         "job_metrics_by_type": job_metrics,
@@ -44,7 +45,7 @@ async def get_dashboard(
             "status": "healthy" if worker_metrics.active_workers > 0 else "degraded",
             "active_workers": worker_metrics.active_workers,
             "queue_depth": queue_depth,
-        }
+        },
     }
 
 
@@ -61,11 +62,11 @@ async def health_check(
     """
     try:
         # Check database
-        await db.execute("SELECT 1")
+        await db.execute(text("SELECT 1"))
         db_healthy = True
     except Exception:
         db_healthy = False
-    
+
     try:
         # Check Redis
         client = await redis.get_client()
@@ -73,14 +74,14 @@ async def health_check(
         redis_healthy = True
     except Exception:
         redis_healthy = False
-    
+
     # Check workers
     worker_service = WorkerService(db)
     workers = await worker_service.list_workers(active_only=True)
     workers_healthy = len(workers) > 0
-    
+
     overall_healthy = db_healthy and redis_healthy and workers_healthy
-    
+
     return {
         "status": "healthy" if overall_healthy else "unhealthy",
         "checks": {
@@ -88,9 +89,9 @@ async def health_check(
             "redis": "up" if redis_healthy else "down",
             "workers": {
                 "status": "up" if workers_healthy else "down",
-                "active_count": len(workers)
-            }
-        }
+                "active_count": len(workers),
+            },
+        },
     }
 
 
@@ -101,7 +102,7 @@ async def get_queue_status(
     """Get current queue status and depth"""
     queue_service = QueueService(redis)
     depth = await queue_service.get_queue_depth()
-    
+
     return {
         "queue_depth": depth,
         "queue_type": "sqs" if queue_service.use_sqs else "redis",
