@@ -25,7 +25,7 @@ from locust import HttpUser, task, between, events
 # Global request counter with semaphore for concurrency safety
 request_lock = Semaphore()
 total_requests_submitted = 0
-MAX_REQUESTS = 20
+MAX_REQUESTS = 50
 
 
 class JobProcessingUser(HttpUser):
