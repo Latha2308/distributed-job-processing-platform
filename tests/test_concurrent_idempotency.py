@@ -79,9 +79,7 @@ def mock_queue_service(mock_redis):
 
 @pytest.mark.asyncio
 async def test_concurrent_create_with_same_idempotency_key(
-    setup_test_tables,
-    mock_redis,
-    mock_queue_service
+    setup_test_tables, mock_redis, mock_queue_service
 ):
     """
     Test that 5 concurrent job creation requests with the same idempotency key
@@ -170,18 +168,17 @@ async def test_concurrent_create_with_same_idempotency_key(
 
     # Verify ALL tasks succeeded (no exceptions)
     exceptions = [r for r in results if isinstance(r, Exception)]
-    assert len(exceptions) == 0, \
-        f"Expected all tasks to succeed, but {len(exceptions)} failed: {exceptions}"
+    assert (
+        len(exceptions) == 0
+    ), f"Expected all tasks to succeed, but {len(exceptions)} failed: {exceptions}"
 
     # Verify all are Job objects
     jobs = [r for r in results if isinstance(r, Job)]
-    assert len(jobs) == num_tasks, \
-        f"Expected {num_tasks} Job objects, got {len(jobs)}"
+    assert len(jobs) == num_tasks, f"Expected {num_tasks} Job objects, got {len(jobs)}"
 
     # Verify all returned the same job ID
     job_ids = {job.id for job in jobs}
-    assert len(job_ids) == 1, \
-        f"Expected 1 unique job ID, got {len(job_ids)}: {job_ids}"
+    assert len(job_ids) == 1, f"Expected 1 unique job ID, got {len(job_ids)}: {job_ids}"
 
     # Get the single job ID
     created_job_id = list(job_ids)[0]
@@ -194,12 +191,14 @@ async def test_concurrent_create_with_same_idempotency_key(
         )
         persisted_jobs = list(job_result.scalars().all())
 
-        assert len(persisted_jobs) == 1, \
-            f"Expected exactly 1 job in database, found {len(persisted_jobs)}"
+        assert (
+            len(persisted_jobs) == 1
+        ), f"Expected exactly 1 job in database, found {len(persisted_jobs)}"
 
         persisted_job = persisted_jobs[0]
-        assert persisted_job.id == created_job_id, \
-            f"Database job ID {persisted_job.id} doesn't match returned ID {created_job_id}"
+        assert (
+            persisted_job.id == created_job_id
+        ), f"Database job ID {persisted_job.id} doesn't match returned ID {created_job_id}"
         assert persisted_job.idempotency_key == idempotency_key
         assert persisted_job.status == JobStatus.QUEUED
 
@@ -209,8 +208,9 @@ async def test_concurrent_create_with_same_idempotency_key(
         )
         outbox_events = list(outbox_result.scalars().all())
 
-        assert len(outbox_events) == 1, \
-            f"Expected exactly 1 outbox event, found {len(outbox_events)}"
+        assert (
+            len(outbox_events) == 1
+        ), f"Expected exactly 1 outbox event, found {len(outbox_events)}"
 
         outbox_event = outbox_events[0]
         assert outbox_event.job_id == created_job_id
@@ -220,9 +220,7 @@ async def test_concurrent_create_with_same_idempotency_key(
 
 @pytest.mark.asyncio
 async def test_concurrent_create_with_different_keys(
-    setup_test_tables,
-    mock_redis,
-    mock_queue_service
+    setup_test_tables, mock_redis, mock_queue_service
 ):
     """
     Test that 5 concurrent requests with different idempotency keys
@@ -275,33 +273,28 @@ async def test_concurrent_create_with_different_keys(
 
     # Verify all succeeded
     exceptions = [r for r in results if isinstance(r, Exception)]
-    assert len(exceptions) == 0, \
-        f"Expected all tasks to succeed, but {len(exceptions)} failed"
+    assert len(exceptions) == 0, f"Expected all tasks to succeed, but {len(exceptions)} failed"
 
     jobs = [r for r in results if isinstance(r, Job)]
     assert len(jobs) == num_tasks
 
     # Verify all have different IDs
     job_ids = {job.id for job in jobs}
-    assert len(job_ids) == num_tasks, \
-        "Expected 5 unique job IDs for 5 different idempotency keys"
+    assert len(job_ids) == num_tasks, "Expected 5 unique job IDs for 5 different idempotency keys"
 
     # Verify database has 5 jobs
     async with TestSessionLocal() as verify_session:
         for key in keys:
-            job_result = await verify_session.execute(
-                select(Job).where(Job.idempotency_key == key)
-            )
+            job_result = await verify_session.execute(select(Job).where(Job.idempotency_key == key))
             jobs_for_key = list(job_result.scalars().all())
-            assert len(jobs_for_key) == 1, \
-                f"Expected 1 job for key {key}, found {len(jobs_for_key)}"
+            assert (
+                len(jobs_for_key) == 1
+            ), f"Expected 1 job for key {key}, found {len(jobs_for_key)}"
 
 
 @pytest.mark.asyncio
 async def test_sequential_then_concurrent_with_same_key(
-    setup_test_tables,
-    mock_redis,
-    mock_queue_service
+    setup_test_tables, mock_redis, mock_queue_service
 ):
     """
     Test mixed sequential and concurrent requests.
@@ -372,8 +365,9 @@ async def test_sequential_then_concurrent_with_same_key(
 
     # Verify all returned the same job ID as the first sequential request
     for job in jobs:
-        assert job.id == first_job_id, \
-            "Concurrent requests should return the same job as sequential request"
+        assert (
+            job.id == first_job_id
+        ), "Concurrent requests should return the same job as sequential request"
 
     # Verify database still has only 1 job and 1 outbox event
     async with TestSessionLocal() as verify_session:
@@ -392,9 +386,7 @@ async def test_sequential_then_concurrent_with_same_key(
 
 @pytest.mark.asyncio
 async def test_concurrent_without_idempotency_key(
-    setup_test_tables,
-    mock_redis,
-    mock_queue_service
+    setup_test_tables, mock_redis, mock_queue_service
 ):
     """
     Test that concurrent requests WITHOUT idempotency keys create separate jobs.
@@ -447,8 +439,9 @@ async def test_concurrent_without_idempotency_key(
 
     # Verify all have different IDs (since no idempotency key)
     job_ids = {job.id for job in jobs}
-    assert len(job_ids) == num_tasks, \
-        "Expected 3 different jobs when no idempotency key is provided"
+    assert (
+        len(job_ids) == num_tasks
+    ), "Expected 3 different jobs when no idempotency key is provided"
 
     # Verify each has its own outbox event
     async with TestSessionLocal() as verify_session:
@@ -457,5 +450,4 @@ async def test_concurrent_without_idempotency_key(
                 select(JobOutbox).where(JobOutbox.job_id == job_id)
             )
             outbox_events = list(outbox_result.scalars().all())
-            assert len(outbox_events) == 1, \
-                f"Expected 1 outbox event for job {job_id}"
+            assert len(outbox_events) == 1, f"Expected 1 outbox event for job {job_id}"

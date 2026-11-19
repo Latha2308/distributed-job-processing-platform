@@ -39,6 +39,99 @@ class JobService:
         self.redis = redis
         self.queue_service = queue_service
 
+    def _is_idempotency_key_collision(self, e: IntegrityError, idempotency_key: str) -> bool:
+        """
+        Determine if IntegrityError is an idempotency key collision.
+
+        Traverses the exception chain to find the asyncpg UniqueViolationError
+        and validates that it's specifically for the ix_jobs_idempotency_key constraint.
+
+        Uses bounded queue-based traversal with cycle detection to handle
+        SQLAlchemy's exception wrapping: IntegrityError -> dialect wrapper -> asyncpg exception.
+
+        Args:
+            e: The IntegrityError to classify
+            idempotency_key: The idempotency key for structured logging
+
+        Returns:
+            True if this is an idempotency key collision, False otherwise
+        """
+        # Traverse the exception chain to find the asyncpg UniqueViolationError
+        # SQLAlchemy wraps exceptions: IntegrityError -> dialect wrapper -> asyncpg exception
+        # Use bounded traversal with cycle detection to find the actual asyncpg exception
+        asyncpg_exception = None
+        visited: set[int] = set()
+        to_visit = []
+
+        # Start from e.orig if it exists
+        if hasattr(e, "orig") and e.orig is not None:
+            to_visit.append(e.orig)
+
+        # Bounded traversal: maximum 5 exception objects
+        max_depth = 5
+        while to_visit and len(visited) < max_depth:
+            current = to_visit.pop(0)
+
+            # Avoid cycles
+            exc_id = id(current)
+            if exc_id in visited:
+                continue
+            visited.add(exc_id)
+
+            # Check if this is the asyncpg UniqueViolationError
+            if isinstance(current, AsyncpgUniqueViolationError):
+                asyncpg_exception = current
+                break
+
+            # Follow __cause__ chain
+            if hasattr(current, "__cause__") and current.__cause__ is not None:
+                to_visit.append(current.__cause__)
+
+            # Follow __context__ chain
+            if hasattr(current, "__context__") and current.__context__ is not None:
+                to_visit.append(current.__context__)
+
+        # If we didn't find asyncpg UniqueViolationError, this is a different error
+        if asyncpg_exception is None:
+            logger.error(
+                "integrity_error_without_unique_violation",
+                error=str(e),
+                orig_type=type(e.orig).__name__ if hasattr(e, "orig") and e.orig else None,
+                visited_count=len(visited),
+            )
+            return False
+
+        # Verify this is a PostgreSQL unique constraint violation (SQLSTATE 23505)
+        sqlstate = getattr(asyncpg_exception, "sqlstate", None)
+        if sqlstate != "23505":
+            logger.error(
+                "unique_violation_with_unexpected_sqlstate",
+                sqlstate=sqlstate,
+                expected="23505",
+            )
+            return False
+
+        # Verify this is specifically the idempotency_key constraint
+        constraint_name = getattr(asyncpg_exception, "constraint_name", None)
+        if constraint_name != "ix_jobs_idempotency_key":
+            logger.error(
+                "unique_violation_for_different_constraint",
+                constraint=constraint_name,
+                expected="ix_jobs_idempotency_key",
+                idempotency_key=idempotency_key,
+            )
+            return False
+
+        # Confirmed: This is a concurrent idempotency key collision
+        logger.info(
+            "concurrent_idempotency_collision_detected",
+            idempotency_key=idempotency_key,
+            constraint=constraint_name,
+            sqlstate=sqlstate,
+        )
+
+        return True
+
     async def create_job(self, job_data: JobCreate) -> Job:
         """
         Create a new job with transactional outbox pattern.
@@ -125,79 +218,15 @@ class JobService:
             # Both job and outbox records are discarded
             # Outer transaction remains valid for querying
 
-            # Traverse the exception chain to find the asyncpg UniqueViolationError
-            # SQLAlchemy wraps exceptions: IntegrityError -> dialect wrapper -> asyncpg exception
-            # Use bounded traversal with cycle detection to find the actual asyncpg exception
-            asyncpg_exception = None
-            visited = set()
-            to_visit = []
-
-            # Start from e.orig if it exists
-            if hasattr(e, 'orig') and e.orig is not None:
-                to_visit.append(e.orig)
-
-            # Bounded traversal: maximum 5 exception objects
-            max_depth = 5
-            while to_visit and len(visited) < max_depth:
-                current = to_visit.pop(0)
-
-                # Avoid cycles
-                exc_id = id(current)
-                if exc_id in visited:
-                    continue
-                visited.add(exc_id)
-
-                # Check if this is the asyncpg UniqueViolationError
-                if isinstance(current, AsyncpgUniqueViolationError):
-                    asyncpg_exception = current
-                    break
-
-                # Follow __cause__ chain
-                if hasattr(current, '__cause__') and current.__cause__ is not None:
-                    to_visit.append(current.__cause__)
-
-                # Follow __context__ chain
-                if hasattr(current, '__context__') and current.__context__ is not None:
-                    to_visit.append(current.__context__)
-
-            # If we didn't find asyncpg UniqueViolationError, this is a different error
-            if asyncpg_exception is None:
-                logger.error(
-                    "integrity_error_without_unique_violation",
-                    error=str(e),
-                    orig_type=type(e.orig).__name__ if hasattr(e, 'orig') and e.orig else None,
-                    visited_count=len(visited),
-                )
+            # Only handle idempotency key collisions when an idempotency key was provided
+            # If no idempotency key, this is a different constraint violation
+            if job_data.idempotency_key is None:
                 raise
 
-            # Verify this is a PostgreSQL unique constraint violation (SQLSTATE 23505)
-            sqlstate = getattr(asyncpg_exception, 'sqlstate', None)
-            if sqlstate != '23505':
-                logger.error(
-                    "unique_violation_with_unexpected_sqlstate",
-                    sqlstate=sqlstate,
-                    expected='23505',
-                )
+            # Classify the exception using extracted helper method
+            if not self._is_idempotency_key_collision(e, job_data.idempotency_key):
+                # Not an idempotency collision - re-raise the original exception
                 raise
-
-            # Verify this is specifically the idempotency_key constraint
-            constraint_name = getattr(asyncpg_exception, 'constraint_name', None)
-            if constraint_name != 'ix_jobs_idempotency_key':
-                logger.error(
-                    "unique_violation_for_different_constraint",
-                    constraint=constraint_name,
-                    expected='ix_jobs_idempotency_key',
-                    idempotency_key=job_data.idempotency_key,
-                )
-                raise
-
-            # Confirmed: This is a concurrent idempotency key collision
-            logger.info(
-                "concurrent_idempotency_collision_detected",
-                idempotency_key=job_data.idempotency_key,
-                constraint=constraint_name,
-                sqlstate=sqlstate,
-            )
 
             # Query for the existing job that won the race
             # This is safe because the savepoint has fully rolled back
@@ -209,7 +238,7 @@ class JobService:
                 logger.error(
                     "concurrent_collision_but_no_existing_job",
                     idempotency_key=job_data.idempotency_key,
-                    constraint=constraint_name,
+                    constraint="ix_jobs_idempotency_key",
                 )
                 raise
 
