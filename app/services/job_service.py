@@ -2,7 +2,7 @@
 
 import time
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Any, List, Optional
 from uuid import UUID
 
 from asyncpg.exceptions import UniqueViolationError as AsyncpgUniqueViolationError
@@ -426,8 +426,40 @@ class JobService:
         job_id: UUID,
         update_data: JobUpdate,
         worker_id: Optional[str] = None,
+        expected_status: Optional[JobStatus] = None,
+        expected_worker_id: Optional[str] = None,
     ) -> Optional[Job]:
-        """Update job status"""
+        """
+        Update job status with optional atomic fencing.
+
+        When fencing parameters are provided (expected_status or expected_worker_id),
+        uses atomic conditional UPDATE to prevent stale workers from overwriting
+        job state that has changed (e.g., by recovery process).
+
+        When fencing parameters are omitted, uses existing read-then-write pattern
+        for backward compatibility.
+
+        Args:
+            job_id: Job ID to update
+            update_data: Status update data
+            worker_id: Worker performing update (for logging)
+            expected_status: If provided, only update if job has this status (atomic fencing)
+            expected_worker_id: If provided, only update if job owned by this worker (atomic fencing)
+
+        Returns:
+            Updated job or None if job not found or fencing check failed
+        """
+        # FENCED PATH: Use atomic conditional UPDATE
+        if expected_status is not None or expected_worker_id is not None:
+            return await self._update_job_status_atomic(
+                job_id,
+                update_data,
+                worker_id,
+                expected_status,
+                expected_worker_id,
+            )
+
+        # UNFENCED PATH: Existing read-then-write pattern (backward compatible)
         job = await self.get_job(job_id)
         if not job:
             return None
@@ -465,6 +497,182 @@ class JobService:
         )
 
         return job
+
+    async def _update_job_status_atomic(
+        self,
+        job_id: UUID,
+        update_data: JobUpdate,
+        worker_id: Optional[str],
+        expected_status: Optional[JobStatus],
+        expected_worker_id: Optional[str],
+    ) -> Optional[Job]:
+        """
+        Atomically update job status with fencing conditions.
+
+        Uses single conditional UPDATE statement similar to claim_job() pattern.
+        Returns None if fencing conditions not met (job state changed or worker lost ownership).
+
+        This prevents stale workers from overwriting job state that has changed,
+        for example by recovery process marking job FAILED after worker timeout.
+
+        Args:
+            job_id: Job ID to update
+            update_data: Status update data
+            worker_id: Worker performing update (for logging)
+            expected_status: Required current status (None = don't check)
+            expected_worker_id: Required current worker_id (None = don't check)
+
+        Returns:
+            Updated job or None if conditions not met
+        """
+        now = datetime.utcnow()
+
+        # Build WHERE conditions for atomic UPDATE
+        conditions = self._build_fencing_conditions(job_id, expected_status, expected_worker_id)
+
+        # Build VALUES for UPDATE
+        values = self._build_update_values(now, update_data, worker_id, expected_worker_id)
+
+        # Execute atomic conditional UPDATE
+        stmt = update(Job).where(and_(*conditions)).values(**values).returning(Job)
+
+        result = await self.db.execute(stmt)
+        updated_job = result.scalar_one_or_none()
+
+        if not updated_job:
+            # Fencing conditions not met - job state changed or worker lost ownership
+            logger.warning(
+                "job_update_fencing_failed",
+                job_id=str(job_id),
+                expected_status=expected_status.value if expected_status else None,
+                expected_worker_id=expected_worker_id,
+                actual_worker_id=worker_id,
+                reason="Job status changed or worker ownership lost",
+            )
+            return None
+
+        # Refresh to get all attributes
+        await self.db.refresh(updated_job)
+
+        # Post-update: Calculate processing_duration and emit metrics
+        await self._handle_post_update_metrics(now, update_data, updated_job)
+
+        logger.info(
+            "job_updated_atomic",
+            job_id=str(job_id),
+            status=updated_job.status.value,
+            worker_id=worker_id,
+            fenced=True,
+        )
+
+        return updated_job
+
+    def _build_fencing_conditions(
+        self,
+        job_id: UUID,
+        expected_status: Optional[JobStatus],
+        expected_worker_id: Optional[str],
+    ) -> list:
+        """Build WHERE conditions for atomic fenced UPDATE."""
+        conditions = [Job.id == job_id]
+
+        if expected_status is not None:
+            conditions.append(Job.status == expected_status)
+
+        if expected_worker_id is not None:
+            conditions.append(Job.worker_id == expected_worker_id)
+
+        return conditions
+
+    def _build_update_values(
+        self,
+        now: datetime,
+        update_data: JobUpdate,
+        worker_id: Optional[str],
+        expected_worker_id: Optional[str],
+    ) -> dict[str, Any]:
+        """Build VALUES dict for atomic UPDATE statement."""
+        values: dict[str, Any] = {"updated_at": now}
+
+        if update_data.status:
+            values["status"] = update_data.status
+            self._add_status_specific_values(
+                values, update_data.status, now, worker_id, expected_worker_id
+            )
+
+        if update_data.result is not None:
+            values["result"] = update_data.result
+
+        if update_data.error_message:
+            values["error_message"] = update_data.error_message
+
+        if update_data.error_type:
+            values["error_type"] = update_data.error_type
+
+        return values
+
+    def _add_status_specific_values(
+        self,
+        values: dict[str, Any],
+        status: JobStatus,
+        now: datetime,
+        worker_id: Optional[str],
+        expected_worker_id: Optional[str],
+    ) -> None:
+        """Add status-specific fields to UPDATE values dict."""
+        if status == JobStatus.COMPLETED:
+            values["completed_at"] = now
+            # Note: processing_duration calculated after UPDATE using started_at
+        elif status == JobStatus.FAILED:
+            values["completed_at"] = now
+        elif status == JobStatus.PROCESSING:
+            values["started_at"] = now
+            if expected_worker_id is None and worker_id is not None:
+                # Only set worker_id if not already being used for fencing
+                values["worker_id"] = worker_id
+
+    async def _handle_post_update_metrics(
+        self,
+        now: datetime,
+        update_data: JobUpdate,
+        updated_job: Job,
+    ) -> None:
+        """Calculate durations and emit metrics after successful fenced update."""
+        if update_data.status == JobStatus.COMPLETED:
+            await self._handle_completed_metrics(now, updated_job)
+        elif update_data.status == JobStatus.FAILED:
+            self._handle_failed_metrics(update_data, updated_job)
+        elif update_data.status == JobStatus.PROCESSING:
+            await self._handle_processing_metrics(now, updated_job)
+
+    async def _handle_completed_metrics(self, now: datetime, job: Job) -> None:
+        """Handle processing duration and completion metrics."""
+        if job.started_at:
+            duration = (now - job.started_at).total_seconds()
+            job.processing_duration = duration
+            await self.db.flush()
+
+            # Update metrics
+            job_processing_duration.labels(job_type=job.job_type).observe(duration)
+
+        job_completions.labels(job_type=job.job_type, status="completed").inc()
+
+    def _handle_failed_metrics(self, update_data: JobUpdate, job: Job) -> None:
+        """Handle failure metrics."""
+        job_completions.labels(job_type=job.job_type, status="failed").inc()
+
+        if update_data.error_type:
+            job_failures.labels(
+                job_type=job.job_type,
+                error_type=update_data.error_type,
+            ).inc()
+
+    async def _handle_processing_metrics(self, now: datetime, job: Job) -> None:
+        """Handle queue wait time calculation."""
+        if job.created_at:
+            wait_time = (now - job.created_at).total_seconds()
+            job.queue_wait_time = wait_time
+            await self.db.flush()
 
     async def retry_job(self, job_id: UUID) -> Optional[Job]:
         """

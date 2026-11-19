@@ -176,17 +176,33 @@ class Worker:
                         timeout=job.timeout,
                     )
 
-                    # Job completed successfully
+                    # Job completed successfully - update with fencing
                     duration = (datetime.utcnow() - start_time).total_seconds()
 
-                    await job_service.update_job_status(
+                    updated_job = await job_service.update_job_status(
                         job_id,
                         JobUpdate(
                             status=JobStatus.COMPLETED,
                             result=result,
                         ),
+                        worker_id=self.worker_id,
+                        expected_status=JobStatus.PROCESSING,
+                        expected_worker_id=self.worker_id,
                     )
 
+                    # Check if fenced update succeeded
+                    if updated_job is None:
+                        # Job state changed (likely recovered) - reject stale completion
+                        await db.rollback()
+                        logger.warning(
+                            "job_completion_fencing_rejected",
+                            job_id=str(job_id),
+                            worker_id=self.worker_id,
+                            reason="Job state changed before worker could complete (likely recovered)",
+                        )
+                        return
+
+                    # Fencing succeeded - record execution and commit
                     await job_service.create_job_execution(
                         job_id=job_id,
                         worker_id=self.worker_id,
@@ -211,21 +227,38 @@ class Worker:
                     )
 
                 except asyncio.TimeoutError:
-                    # Job timed out
+                    # Job timed out - update with fencing
                     logger.warning(
                         "job_timeout",
                         job_id=str(job_id),
                         timeout=job.timeout,
                     )
 
-                    await job_service.update_job_status(
+                    updated_job = await job_service.update_job_status(
                         job_id,
                         JobUpdate(
                             status=JobStatus.FAILED,
                             error_message=f"Job exceeded timeout of {job.timeout} seconds",
                             error_type="TimeoutError",
                         ),
+                        worker_id=self.worker_id,
+                        expected_status=JobStatus.PROCESSING,
+                        expected_worker_id=self.worker_id,
                     )
+
+                    # Check if fenced update succeeded
+                    if updated_job is None:
+                        # Job state changed (likely recovered) - reject stale timeout failure
+                        await db.rollback()
+                        logger.warning(
+                            "job_timeout_fencing_rejected",
+                            job_id=str(job_id),
+                            worker_id=self.worker_id,
+                            reason="Job state changed before worker could mark timeout (likely recovered)",
+                        )
+                        return
+
+                    # Fencing succeeded - commit and schedule retry
                     await db.commit()
 
                     # Retry job
@@ -233,7 +266,7 @@ class Worker:
                     await db.commit()
 
                 except Exception as e:
-                    # Job failed
+                    # Job failed - update with fencing
                     error_type = type(e).__name__
                     error_message = str(e)
 
@@ -246,15 +279,31 @@ class Worker:
 
                     duration = (datetime.utcnow() - start_time).total_seconds()
 
-                    await job_service.update_job_status(
+                    updated_job = await job_service.update_job_status(
                         job_id,
                         JobUpdate(
                             status=JobStatus.FAILED,
                             error_message=error_message,
                             error_type=error_type,
                         ),
+                        worker_id=self.worker_id,
+                        expected_status=JobStatus.PROCESSING,
+                        expected_worker_id=self.worker_id,
                     )
 
+                    # Check if fenced update succeeded
+                    if updated_job is None:
+                        # Job state changed (likely recovered) - reject stale failure
+                        await db.rollback()
+                        logger.warning(
+                            "job_failure_fencing_rejected",
+                            job_id=str(job_id),
+                            worker_id=self.worker_id,
+                            reason="Job state changed before worker could mark failure (likely recovered)",
+                        )
+                        return
+
+                    # Fencing succeeded - record execution, commit, and schedule retry
                     await job_service.create_job_execution(
                         job_id=job_id,
                         worker_id=self.worker_id,
