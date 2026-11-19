@@ -5,7 +5,9 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from uuid import UUID
 
+from asyncpg.exceptions import UniqueViolationError as AsyncpgUniqueViolationError
 from sqlalchemy import select, func, and_, or_, Integer, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging_config import setup_logging
@@ -44,67 +46,180 @@ class JobService:
         Creates both Job and JobOutbox records in the same transaction.
         The outbox dispatcher will asynchronously publish to Redis.
 
+        Handles concurrent requests with duplicate idempotency keys by using
+        SQLAlchemy savepoints (nested transactions) to isolate insertion attempts.
+        When a concurrent duplicate is detected (UniqueViolationError), the savepoint
+        is rolled back and the existing job is returned.
+
         Transaction is managed by the caller (get_db dependency).
 
         Args:
             job_data: Job creation data
 
         Returns:
-            Created job
+            Created or existing job
 
         Raises:
-            ValueError: If idempotency key already exists
+            IntegrityError: If a non-idempotency constraint is violated
         """
-        # Check idempotency - return existing job WITHOUT creating new outbox event
+        # Fast path: Check idempotency - return existing job WITHOUT creating new outbox event
+        # This handles sequential duplicates efficiently without entering a savepoint
         if job_data.idempotency_key:
             existing = await self._get_job_by_idempotency_key(job_data.idempotency_key)
             if existing:
                 logger.info(
-                    "job_already_exists",
+                    "job_already_exists_sequential",
                     idempotency_key=job_data.idempotency_key,
                     job_id=str(existing.id),
                 )
                 return existing
 
-        # Create job record
-        job = Job(
-            job_type=job_data.job_type,
-            payload=job_data.payload,
-            priority=job_data.priority,
-            idempotency_key=job_data.idempotency_key,
-            timeout=job_data.timeout,
-            max_retries=job_data.max_retries,
-            status=JobStatus.QUEUED,
-        )
+        # Use a savepoint (nested transaction) to isolate the insertion attempt
+        # The try/except is OUTSIDE to allow the savepoint to fully roll back
+        # before we query for the existing job
+        try:
+            async with self.db.begin_nested():  # Creates PostgreSQL SAVEPOINT
+                # Create job record
+                job = Job(
+                    job_type=job_data.job_type,
+                    payload=job_data.payload,
+                    priority=job_data.priority,
+                    idempotency_key=job_data.idempotency_key,
+                    timeout=job_data.timeout,
+                    max_retries=job_data.max_retries,
+                    status=JobStatus.QUEUED,
+                )
 
-        self.db.add(job)
-        await self.db.flush()
-        await self.db.refresh(job)
+                self.db.add(job)
+                await self.db.flush()
+                await self.db.refresh(job)
 
-        # Create outbox event in same transaction
-        outbox_event = JobOutbox(
-            job_id=job.id,
-            event_type="job_created",
-            published=False,
-            attempts=0,
-        )
+                # Create outbox event in same nested transaction
+                outbox_event = JobOutbox(
+                    job_id=job.id,
+                    event_type="job_created",
+                    published=False,
+                    attempts=0,
+                )
 
-        self.db.add(outbox_event)
-        await self.db.flush()
-        await self.db.refresh(outbox_event)
+                self.db.add(outbox_event)
+                await self.db.flush()
+                await self.db.refresh(outbox_event)
 
-        # Update metrics
-        job_submissions.labels(job_type=job.job_type, priority=str(job.priority)).inc()
+                # Update metrics
+                job_submissions.labels(job_type=job.job_type, priority=str(job.priority)).inc()
 
-        logger.info(
-            "job_created_with_outbox",
-            job_id=str(job.id),
-            outbox_event_id=str(outbox_event.id),
-            job_type=job.job_type,
-            priority=job.priority,
-        )
+                logger.info(
+                    "job_created_with_outbox",
+                    job_id=str(job.id),
+                    outbox_event_id=str(outbox_event.id),
+                    job_type=job.job_type,
+                    priority=job.priority,
+                )
 
-        return job
+                return job
+                # SAVEPOINT commits here if no exception raised
+
+        except IntegrityError as e:
+            # Savepoint has been FULLY rolled back by the context manager exit
+            # Both job and outbox records are discarded
+            # Outer transaction remains valid for querying
+
+            # Traverse the exception chain to find the asyncpg UniqueViolationError
+            # SQLAlchemy wraps exceptions: IntegrityError -> dialect wrapper -> asyncpg exception
+            # Use bounded traversal with cycle detection to find the actual asyncpg exception
+            asyncpg_exception = None
+            visited = set()
+            to_visit = []
+
+            # Start from e.orig if it exists
+            if hasattr(e, 'orig') and e.orig is not None:
+                to_visit.append(e.orig)
+
+            # Bounded traversal: maximum 5 exception objects
+            max_depth = 5
+            while to_visit and len(visited) < max_depth:
+                current = to_visit.pop(0)
+
+                # Avoid cycles
+                exc_id = id(current)
+                if exc_id in visited:
+                    continue
+                visited.add(exc_id)
+
+                # Check if this is the asyncpg UniqueViolationError
+                if isinstance(current, AsyncpgUniqueViolationError):
+                    asyncpg_exception = current
+                    break
+
+                # Follow __cause__ chain
+                if hasattr(current, '__cause__') and current.__cause__ is not None:
+                    to_visit.append(current.__cause__)
+
+                # Follow __context__ chain
+                if hasattr(current, '__context__') and current.__context__ is not None:
+                    to_visit.append(current.__context__)
+
+            # If we didn't find asyncpg UniqueViolationError, this is a different error
+            if asyncpg_exception is None:
+                logger.error(
+                    "integrity_error_without_unique_violation",
+                    error=str(e),
+                    orig_type=type(e.orig).__name__ if hasattr(e, 'orig') and e.orig else None,
+                    visited_count=len(visited),
+                )
+                raise
+
+            # Verify this is a PostgreSQL unique constraint violation (SQLSTATE 23505)
+            sqlstate = getattr(asyncpg_exception, 'sqlstate', None)
+            if sqlstate != '23505':
+                logger.error(
+                    "unique_violation_with_unexpected_sqlstate",
+                    sqlstate=sqlstate,
+                    expected='23505',
+                )
+                raise
+
+            # Verify this is specifically the idempotency_key constraint
+            constraint_name = getattr(asyncpg_exception, 'constraint_name', None)
+            if constraint_name != 'ix_jobs_idempotency_key':
+                logger.error(
+                    "unique_violation_for_different_constraint",
+                    constraint=constraint_name,
+                    expected='ix_jobs_idempotency_key',
+                    idempotency_key=job_data.idempotency_key,
+                )
+                raise
+
+            # Confirmed: This is a concurrent idempotency key collision
+            logger.info(
+                "concurrent_idempotency_collision_detected",
+                idempotency_key=job_data.idempotency_key,
+                constraint=constraint_name,
+                sqlstate=sqlstate,
+            )
+
+            # Query for the existing job that won the race
+            # This is safe because the savepoint has fully rolled back
+            existing = await self._get_job_by_idempotency_key(job_data.idempotency_key)
+
+            if not existing:
+                # Edge case: constraint violated but no existing job found
+                # This could happen if the winning job was deleted immediately
+                logger.error(
+                    "concurrent_collision_but_no_existing_job",
+                    idempotency_key=job_data.idempotency_key,
+                    constraint=constraint_name,
+                )
+                raise
+
+            logger.info(
+                "concurrent_duplicate_resolved",
+                idempotency_key=job_data.idempotency_key,
+                existing_job_id=str(existing.id),
+            )
+
+            return existing
 
     async def get_job(self, job_id: UUID) -> Optional[Job]:
         """Get job by ID"""
