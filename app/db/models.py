@@ -19,7 +19,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.database import Base
+from app.db.base import Base
 
 
 class JobStatus(str, enum.Enum):
@@ -99,12 +99,18 @@ class Job(Base):
     is_dead_letter: Mapped[Optional[bool]] = mapped_column(Boolean, default=False, index=True)
     moved_to_dlq_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
+    # Recovery throttling
+    # NULL means job has never been subject to recovery
+    # Non-NULL means last recovery attempt occurred at this timestamp
+    last_recovery_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
     # Indexes for performance
     __table_args__ = (
         Index("idx_job_status_priority", "status", "priority"),
         Index("idx_job_type_status", "job_type", "status"),
         Index("idx_created_at", "created_at"),
         Index("idx_next_retry", "next_retry_at"),
+        Index("idx_jobs_status_recovery_attempt", "status", "last_recovery_attempt_at"),
     )
 
     def __repr__(self) -> str:
@@ -194,15 +200,32 @@ class JobOutbox(Base):
     published: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    # Retry attempt tracking (immutable identifier for job_recovered events)
+    # NULL for job_created events, set to job.retry_count for job_recovered events
+    retry_attempt: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     published_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
+    # Durable retry scheduling with exponential backoff
+    # NULL means eligible for immediate publication
+    # Non-NULL means wait until this timestamp before retrying
+    next_publication_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # Reconciliation state for invalid/undeliverable events
+    # False means normal operation (eligible for retry or successfully published)
+    # True means needs manual reconciliation (won't be auto-retried)
+    reconciliation_required: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     # Error tracking
     last_error: Mapped[Optional[str]] = mapped_column(Text)
 
-    # Composite index for efficient polling
-    __table_args__ = (Index("idx_outbox_published_created", "published", "created_at"),)
+    # Composite indexes for efficient polling and retry tracking
+    __table_args__ = (
+        Index("idx_outbox_published_created", "published", "created_at"),
+        Index("idx_outbox_job_retry", "job_id", "retry_attempt"),
+    )
 
     def __repr__(self) -> str:
         return f"<JobOutbox(id={self.id}, job_id={self.job_id}, event_type={self.event_type}, published={self.published})>"

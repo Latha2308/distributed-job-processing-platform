@@ -6,7 +6,7 @@ from typing import Any, List, Optional
 from uuid import UUID
 
 from asyncpg.exceptions import UniqueViolationError as AsyncpgUniqueViolationError
-from sqlalchemy import select, func, and_, or_, Integer, update
+from sqlalchemy import select, func, and_, Integer, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -306,6 +306,7 @@ class JobService:
         self,
         job_id: UUID,
         worker_id: str,
+        retry_attempt: Optional[int] = None,
     ) -> Optional[Job]:
         """
         Atomically claim a job for processing using conditional UPDATE.
@@ -314,8 +315,11 @@ class JobService:
         can claim a job. The UPDATE only succeeds if the job is in an eligible state.
 
         Eligible states:
-        - QUEUED: Jobs ready for first execution
-        - RETRYING: Jobs scheduled for retry where next_retry_at <= now
+        - QUEUED: Jobs ready for first execution (retry_attempt must be None)
+        - RETRYING: Jobs scheduled for retry where:
+          * retry_attempt must be provided and valid
+          * retry_attempt matches job.retry_count (prevents duplicate execution)
+          * next_retry_at <= now
 
         Ineligible states:
         - PROCESSING: Already being worked on
@@ -323,9 +327,16 @@ class JobService:
         - FAILED: Requires manual intervention or retry scheduling
         - DEAD_LETTER: Permanently failed
 
+        Retry Attempt Validation:
+        - RETRYING jobs REQUIRE valid retry_attempt (prevents bypass)
+        - retry_attempt must be a positive integer matching job.retry_count
+        - QUEUED jobs MUST NOT have retry_attempt (initial execution only)
+        - Malformed values (bool, str, float, negative, zero) are rejected
+
         Args:
             job_id: ID of job to claim
             worker_id: ID of worker attempting to claim
+            retry_attempt: Expected retry attempt number (required for RETRYING jobs)
 
         Returns:
             Job object if successfully claimed, None if claim failed
@@ -333,26 +344,54 @@ class JobService:
         Raises:
             None - returns None on failure rather than raising exceptions
         """
+        # Validate retry_attempt type and value before building SQL
+        if retry_attempt is not None:
+            # Reject malformed values - do not silently convert to None
+            if not isinstance(retry_attempt, int) or isinstance(retry_attempt, bool):
+                logger.warning(
+                    "job_claim_failed_invalid_retry_attempt_type",
+                    job_id=str(job_id),
+                    worker_id=worker_id,
+                    retry_attempt=retry_attempt,
+                    retry_attempt_type=type(retry_attempt).__name__,
+                )
+                return None
+
+            # Reject invalid integer values
+            if retry_attempt <= 0:
+                logger.warning(
+                    "job_claim_failed_invalid_retry_attempt_value",
+                    job_id=str(job_id),
+                    worker_id=worker_id,
+                    retry_attempt=retry_attempt,
+                )
+                return None
+
         now = datetime.utcnow()
+
+        # Build conditions based on whether this is a retry or initial attempt
+        conditions = [Job.id == job_id]
+
+        if retry_attempt is not None:
+            # Claiming a recovered retry attempt
+            # RETRYING jobs require explicit retry_attempt validation
+            conditions.append(
+                and_(
+                    Job.status == JobStatus.RETRYING,
+                    Job.retry_count == retry_attempt,  # Must match exactly
+                    Job.next_retry_at.isnot(None),
+                    Job.next_retry_at <= now,
+                )
+            )
+        else:
+            # Claiming initial job - ONLY QUEUED status allowed
+            # RETRYING jobs MUST provide retry_attempt (no bypass)
+            conditions.append(Job.status == JobStatus.QUEUED)
 
         # Build atomic UPDATE statement with conditions
         stmt = (
             update(Job)
-            .where(
-                and_(
-                    Job.id == job_id,
-                    # Allow QUEUED jobs
-                    or_(
-                        Job.status == JobStatus.QUEUED,
-                        # Allow RETRYING jobs only if retry time has arrived
-                        and_(
-                            Job.status == JobStatus.RETRYING,
-                            Job.next_retry_at.isnot(None),
-                            Job.next_retry_at <= now,
-                        ),
-                    ),
-                )
-            )
+            .where(and_(*conditions))
             .values(
                 status=JobStatus.PROCESSING,
                 worker_id=worker_id,
@@ -378,6 +417,7 @@ class JobService:
                 worker_id=worker_id,
                 previous_status="queued_or_retrying",
                 retry_count=claimed_job.retry_count,
+                retry_attempt=retry_attempt,
             )
 
             return claimed_job
@@ -387,7 +427,8 @@ class JobService:
                 "job_claim_failed",
                 job_id=str(job_id),
                 worker_id=worker_id,
-                reason="Job not in eligible state or already claimed by another worker",
+                retry_attempt=retry_attempt,
+                reason="Job not in eligible state, already claimed, or stale retry_attempt",
             )
             return None
 
@@ -421,45 +462,62 @@ class JobService:
             wait_time = (job.started_at - job.created_at).total_seconds()
             job.queue_wait_time = wait_time
 
-    async def update_job_status(
-        self,
-        job_id: UUID,
-        update_data: JobUpdate,
-        worker_id: Optional[str] = None,
-        expected_status: Optional[JobStatus] = None,
-        expected_worker_id: Optional[str] = None,
-    ) -> Optional[Job]:
+    def _validate_expected_retry_count(
+        self, job_id: UUID, expected_retry_count: Optional[int]
+    ) -> bool:
         """
-        Update job status with optional atomic fencing.
-
-        When fencing parameters are provided (expected_status or expected_worker_id),
-        uses atomic conditional UPDATE to prevent stale workers from overwriting
-        job state that has changed (e.g., by recovery process).
-
-        When fencing parameters are omitted, uses existing read-then-write pattern
-        for backward compatibility.
+        Validate expected_retry_count parameter for execution-generation fencing.
 
         Args:
-            job_id: Job ID to update
-            update_data: Status update data
-            worker_id: Worker performing update (for logging)
-            expected_status: If provided, only update if job has this status (atomic fencing)
-            expected_worker_id: If provided, only update if job owned by this worker (atomic fencing)
+            job_id: Job ID for logging
+            expected_retry_count: Expected retry count value to validate
 
         Returns:
-            Updated job or None if job not found or fencing check failed
+            True if valid, False if invalid (logs warning)
         """
-        # FENCED PATH: Use atomic conditional UPDATE
-        if expected_status is not None or expected_worker_id is not None:
-            return await self._update_job_status_atomic(
-                job_id,
-                update_data,
-                worker_id,
-                expected_status,
-                expected_worker_id,
-            )
+        if expected_retry_count is None:
+            return True
 
-        # UNFENCED PATH: Existing read-then-write pattern (backward compatible)
+        if not isinstance(expected_retry_count, int) or isinstance(expected_retry_count, bool):
+            logger.warning(
+                "invalid_expected_retry_count_type",
+                job_id=str(job_id),
+                expected_retry_count=expected_retry_count,
+                expected_retry_count_type=type(expected_retry_count).__name__,
+            )
+            return False
+
+        if expected_retry_count < 0:
+            logger.warning(
+                "invalid_expected_retry_count_value",
+                job_id=str(job_id),
+                expected_retry_count=expected_retry_count,
+            )
+            return False
+
+        return True
+
+    def _should_use_fenced_update(
+        self,
+        expected_status: Optional[JobStatus],
+        expected_worker_id: Optional[str],
+        expected_retry_count: Optional[int],
+    ) -> bool:
+        """Check if fenced atomic update should be used."""
+        return (
+            expected_status is not None
+            or expected_worker_id is not None
+            or expected_retry_count is not None
+        )
+
+    async def _update_job_unfenced(
+        self, job_id: UUID, update_data: JobUpdate, worker_id: Optional[str]
+    ) -> Optional[Job]:
+        """
+        Update job using read-then-write pattern (backward compatible).
+
+        Used when no fencing parameters are provided.
+        """
         job = await self.get_job(job_id)
         if not job:
             return None
@@ -498,6 +556,56 @@ class JobService:
 
         return job
 
+    async def update_job_status(
+        self,
+        job_id: UUID,
+        update_data: JobUpdate,
+        worker_id: Optional[str] = None,
+        expected_status: Optional[JobStatus] = None,
+        expected_worker_id: Optional[str] = None,
+        expected_retry_count: Optional[int] = None,
+    ) -> Optional[Job]:
+        """
+        Update job status with optional atomic fencing.
+
+        When fencing parameters are provided (expected_status, expected_worker_id,
+        or expected_retry_count), uses atomic conditional UPDATE to prevent stale
+        workers from overwriting job state that has changed (e.g., by recovery process).
+
+        When fencing parameters are omitted, uses existing read-then-write pattern
+        for backward compatibility.
+
+        Args:
+            job_id: Job ID to update
+            update_data: Status update data
+            worker_id: Worker performing update (for logging)
+            expected_status: If provided, only update if job has this status (atomic fencing)
+            expected_worker_id: If provided, only update if job owned by this worker (atomic fencing)
+            expected_retry_count: If provided, only update if job is at this execution generation (atomic fencing)
+
+        Returns:
+            Updated job or None if job not found or fencing check failed
+        """
+        # Validate expected_retry_count if provided
+        if not self._validate_expected_retry_count(job_id, expected_retry_count):
+            return None
+
+        # FENCED PATH: Use atomic conditional UPDATE
+        if self._should_use_fenced_update(
+            expected_status, expected_worker_id, expected_retry_count
+        ):
+            return await self._update_job_status_atomic(
+                job_id,
+                update_data,
+                worker_id,
+                expected_status,
+                expected_worker_id,
+                expected_retry_count,
+            )
+
+        # UNFENCED PATH: Existing read-then-write pattern (backward compatible)
+        return await self._update_job_unfenced(job_id, update_data, worker_id)
+
     async def _update_job_status_atomic(
         self,
         job_id: UUID,
@@ -505,6 +613,7 @@ class JobService:
         worker_id: Optional[str],
         expected_status: Optional[JobStatus],
         expected_worker_id: Optional[str],
+        expected_retry_count: Optional[int],
     ) -> Optional[Job]:
         """
         Atomically update job status with fencing conditions.
@@ -513,7 +622,8 @@ class JobService:
         Returns None if fencing conditions not met (job state changed or worker lost ownership).
 
         This prevents stale workers from overwriting job state that has changed,
-        for example by recovery process marking job FAILED after worker timeout.
+        for example by recovery process marking job FAILED after worker timeout,
+        or when worker ID is reused and execution generation has advanced.
 
         Args:
             job_id: Job ID to update
@@ -521,6 +631,7 @@ class JobService:
             worker_id: Worker performing update (for logging)
             expected_status: Required current status (None = don't check)
             expected_worker_id: Required current worker_id (None = don't check)
+            expected_retry_count: Required current retry_count/generation (None = don't check)
 
         Returns:
             Updated job or None if conditions not met
@@ -528,7 +639,9 @@ class JobService:
         now = datetime.utcnow()
 
         # Build WHERE conditions for atomic UPDATE
-        conditions = self._build_fencing_conditions(job_id, expected_status, expected_worker_id)
+        conditions = self._build_fencing_conditions(
+            job_id, expected_status, expected_worker_id, expected_retry_count
+        )
 
         # Build VALUES for UPDATE
         values = self._build_update_values(now, update_data, worker_id, expected_worker_id)
@@ -546,8 +659,9 @@ class JobService:
                 job_id=str(job_id),
                 expected_status=expected_status.value if expected_status else None,
                 expected_worker_id=expected_worker_id,
+                expected_retry_count=expected_retry_count,
                 actual_worker_id=worker_id,
-                reason="Job status changed or worker ownership lost",
+                reason="Job status changed, worker ownership lost, or execution generation advanced",
             )
             return None
 
@@ -563,6 +677,7 @@ class JobService:
             status=updated_job.status.value,
             worker_id=worker_id,
             fenced=True,
+            expected_retry_count=expected_retry_count,
         )
 
         return updated_job
@@ -572,6 +687,7 @@ class JobService:
         job_id: UUID,
         expected_status: Optional[JobStatus],
         expected_worker_id: Optional[str],
+        expected_retry_count: Optional[int],
     ) -> list:
         """Build WHERE conditions for atomic fenced UPDATE."""
         conditions = [Job.id == job_id]
@@ -581,6 +697,9 @@ class JobService:
 
         if expected_worker_id is not None:
             conditions.append(Job.worker_id == expected_worker_id)
+
+        if expected_retry_count is not None:
+            conditions.append(Job.retry_count == expected_retry_count)
 
         return conditions
 
@@ -726,6 +845,7 @@ class JobService:
                     "job_id": str(job.id),
                     "job_type": job.job_type,
                     "priority": job.priority,
+                    "retry_attempt": next_retry_count,
                 },
                 execute_at=execute_at,
                 queue_name="job_queue_delayed",

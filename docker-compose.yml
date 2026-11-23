@@ -122,6 +122,33 @@ services:
     command: python -m app.dispatcher.dispatcher_cli --dispatcher-id dispatcher-01 --log-level INFO
     restart: unless-stopped
 
+  recovery:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: jobprocessing-recovery
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/jobprocessing
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in your .env file}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: >
+      python -m app.recovery.recovery_cli
+      --runner-id recovery-01
+      --batch-size 10
+      --poll-interval 60
+      --queued-batch-size 10
+      --queued-age-threshold-minutes 10
+      --queued-throttle-hours 1
+      --log-level INFO
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:latest
     container_name: jobprocessing-prometheus

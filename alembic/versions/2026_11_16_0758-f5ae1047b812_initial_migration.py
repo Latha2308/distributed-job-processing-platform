@@ -1,7 +1,7 @@
 """Initial migration
 
 Revision ID: f5ae1047b812
-Revises: 
+Revises:
 Create Date: 2026-11-16 07:58:17.116670+00:00
 
 """
@@ -107,4 +107,9 @@ def downgrade() -> None:
     op.drop_index('idx_job_execution_status', table_name='job_executions')
     op.drop_index('idx_job_execution_job_id', table_name='job_executions')
     op.drop_table('job_executions')
+
+    # Drop PostgreSQL ENUM type created by this migration
+    # Must be done after all dependent tables are dropped
+    # The jobstatus enum is used by both jobs and job_executions tables
+    op.execute('DROP TYPE IF EXISTS jobstatus')
     # ### end Alembic commands ###

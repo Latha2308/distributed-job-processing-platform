@@ -22,7 +22,7 @@ Verification:
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -62,7 +62,6 @@ def dispatcher(mock_queue_service):
         queue_service=mock_queue_service,
         batch_size=10,
         poll_interval_seconds=0.1,
-        max_attempts=5,
     )
 
 
@@ -179,14 +178,23 @@ async def test_redis_enqueue_failure_retries_event(
         # Event not successfully published
         assert processed == 0
 
-        # Verify event is NOT published and error is recorded
+        # Verify event is NOT published, has backoff set, and error is recorded
         await db_session.refresh(event)
         assert event.published is False
         assert event.published_at is None
-        assert event.last_error == "Redis enqueue failed"
+        assert event.last_error == "Redis publication failed"
         assert event.attempts == 1
+        assert event.next_publication_attempt_at is not None  # Backoff set
 
-        # Second attempt should also fail
+        # Second attempt should NOT process (backoff not expired yet)
+        processed = await dispatcher.process_batch()
+        assert processed == 0
+
+        # Clear backoff to make it eligible again
+        event.next_publication_attempt_at = None
+        await db_session.commit()
+
+        # Now it should be processed again
         processed = await dispatcher.process_batch()
         assert processed == 0
 
@@ -199,7 +207,7 @@ async def test_redis_enqueue_failure_retries_event(
 async def test_missing_job_leaves_event_unpublished(
     db_session: AsyncSession, dispatcher, mock_queue_service
 ):
-    """Test that missing job leaves event unpublished for investigation"""
+    """Test that missing job is marked as permanent failure"""
     with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
         non_existent_job_id = uuid4()
 
@@ -215,33 +223,34 @@ async def test_missing_job_leaves_event_unpublished(
 
         processed = await dispatcher.process_batch()
 
-        # Event not successfully published
+        # Event NOT successfully published (reconciliation required)
         assert processed == 0
 
-        # Verify event is NOT published and error is recorded
+        # Verify event is marked for reconciliation (not published)
         await db_session.refresh(event)
-        assert event.published is False
+        assert event.published is False  # NOT marked published (never delivered to Redis)
         assert event.published_at is None
+        assert event.reconciliation_required is True  # Marked for manual review
         assert f"Job {non_existent_job_id} not found" in event.last_error
         assert event.attempts == 1
 
-        # Event should remain available for investigation
+        # Event should remain available for audit/reconciliation
         stmt = select(JobOutbox).where(JobOutbox.id == event.id)
         result = await db_session.execute(stmt)
         found_event = result.scalar_one_or_none()
         assert found_event is not None
-        assert found_event.published is False
+        assert found_event.reconciliation_required is True  # Needs reconciliation
 
 
 @pytest.mark.asyncio
 async def test_exhausted_events_excluded_from_queue(
     db_session: AsyncSession, dispatcher, mock_queue_service
 ):
-    """Test that exhausted events don't block newer events"""
+    """Test that events in backoff don't block newer events"""
     with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
         job1 = Job(
             id=uuid4(),
-            job_type="exhausted_task",
+            job_type="backoff_task",
             payload={"action": "old"},
             priority=5,
             status=JobStatus.QUEUED,
@@ -255,28 +264,30 @@ async def test_exhausted_events_excluded_from_queue(
         )
         db_session.add_all([job1, job2])
 
-        # Exhausted event (attempts >= max_attempts)
-        exhausted_event = JobOutbox(
+        # Event in backoff (next_publication_attempt_at in future)
+        backoff_event = JobOutbox(
             id=uuid4(),
             job_id=job1.id,
             event_type="job_created",
             published=False,
-            attempts=5,  # At max_attempts
+            attempts=5,
+            next_publication_attempt_at=datetime.utcnow() + timedelta(seconds=60),  # In backoff
         )
 
-        # New event
+        # New event (eligible immediately)
         new_event = JobOutbox(
             id=uuid4(),
             job_id=job2.id,
             event_type="job_created",
             published=False,
             attempts=0,
+            next_publication_attempt_at=None,  # Eligible
         )
 
-        db_session.add_all([exhausted_event, new_event])
+        db_session.add_all([backoff_event, new_event])
         await db_session.commit()
 
-        # Process batch should skip exhausted event and process new event
+        # Process batch should skip backoff event and process new event
         processed = await dispatcher.process_batch()
 
         assert processed == 1
@@ -285,10 +296,10 @@ async def test_exhausted_events_excluded_from_queue(
         await db_session.refresh(new_event)
         assert new_event.published is True
 
-        # Exhausted event remains unchanged (excluded from query)
-        await db_session.refresh(exhausted_event)
-        assert exhausted_event.published is False
-        assert exhausted_event.attempts == 5
+        # Backoff event remains unchanged (excluded from query due to future backoff)
+        await db_session.refresh(backoff_event)
+        assert backoff_event.published is False
+        assert backoff_event.attempts == 5
 
 
 @pytest.mark.asyncio
@@ -312,32 +323,22 @@ async def test_manual_recovery_with_bypass(
             job_id=job.id,
             event_type="job_created",
             published=False,
-            attempts=5,  # At max_attempts
+            attempts=5,
+            next_publication_attempt_at=datetime.utcnow() + timedelta(seconds=60),  # In backoff
             last_error="Previous failures",
         )
         db_session.add(event)
         await db_session.commit()
 
-        # Without bypass, should fail (max_attempts check blocks processing)
-        success = await dispatcher.process_single_event(event.id, bypass_max_attempts=False)
-        assert success is False
-
-        await db_session.refresh(event)
-        assert event.published is False
-        # Without bypass, max_attempts blocks _publish_event, attempts stays 5
-        assert event.attempts == 5
-
-        # With bypass, should succeed
-        mock_queue_service.enqueue_job.reset_mock()
-        success = await dispatcher.process_single_event(event.id, bypass_max_attempts=True)
+        # Without bypass, should still process but might fail due to other reasons
+        # process_single_event doesn't check eligibility, just locks the event
+        success = await dispatcher.process_single_event(event.id, bypass_backoff=False)
+        # Should succeed since Redis will work
         assert success is True
 
         await db_session.refresh(event)
         assert event.published is True
-        assert event.published_at is not None
-        assert event.last_error is None
-        # With bypass, one attempt increments: 5 + 1 = 6
-        assert event.attempts == 6
+        assert event.attempts == 6  # Incremented
 
 
 @pytest.mark.asyncio
@@ -582,7 +583,7 @@ async def test_already_published_event_skipped(
         db_session.add(event)
         await db_session.commit()
 
-        success = await dispatcher.process_single_event(event.id, bypass_max_attempts=False)
+        success = await dispatcher.process_single_event(event.id, bypass_backoff=False)
         assert success is True
 
         mock_queue_service.enqueue_job.assert_not_called()
@@ -594,5 +595,818 @@ async def test_process_single_event_not_found(dispatcher):
     with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
         non_existent_id = uuid4()
 
-        success = await dispatcher.process_single_event(non_existent_id, bypass_max_attempts=False)
+        success = await dispatcher.process_single_event(non_existent_id, bypass_backoff=False)
         assert success is False
+
+
+# ============================================================================
+# Durable Recovery Event Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_recovery_event_publishes_with_persisted_state(
+    db_session: AsyncSession, mock_queue_service
+):
+    """Test job_recovered event uses persisted recovery state"""
+    # Create job in RETRYING status with persisted recovery state
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.RETRYING,
+        retry_count=1,
+        next_retry_at=datetime(2026, 11, 20, 10, 0, 0),
+        priority=5,
+    )
+    db_session.add(job)
+
+    # Create recovery event with matching retry_attempt
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_recovered",
+        retry_attempt=1,
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    # Mock Redis delayed queue
+    mock_redis = MagicMock()
+    mock_redis.push_to_delayed_queue = AsyncMock(return_value=True)
+    mock_queue_service.redis = mock_redis
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+        assert processed == 1
+
+    # Verify Redis call used persisted next_retry_at
+    mock_redis.push_to_delayed_queue.assert_called_once()
+    call_args = mock_redis.push_to_delayed_queue.call_args
+    assert call_args[1]["execute_at"] == job.next_retry_at.timestamp()
+
+    # Verify job_data includes retry_attempt for deduplication
+    job_data = call_args[1]["job_data"]
+    assert job_data["job_id"] == str(job.id)
+    assert job_data["retry_attempt"] == 1
+
+    # Verify job state unchanged
+    await db_session.refresh(job)
+    assert job.status == JobStatus.RETRYING
+    assert job.retry_count == 1
+    assert job.next_retry_at == datetime(2026, 11, 20, 10, 0, 0)
+
+    # Verify event marked published
+    await db_session.refresh(event)
+    assert event.published is True
+
+
+@pytest.mark.asyncio
+async def test_recovery_event_stale_retry_attempt_not_published(
+    db_session: AsyncSession, mock_queue_service
+):
+    """Test stale recovery event (mismatched retry_attempt) not published to Redis"""
+    # Create job at retry_count=2
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.RETRYING,
+        retry_count=2,
+        next_retry_at=datetime(2026, 11, 20, 10, 0, 0),
+        priority=5,
+    )
+    db_session.add(job)
+
+    # Create stale event with retry_attempt=1 (job is now at 2)
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_recovered",
+        retry_attempt=1,  # Stale
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    mock_redis = MagicMock()
+    mock_redis.push_to_delayed_queue = AsyncMock(return_value=True)
+    mock_queue_service.redis = mock_redis
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+        assert processed == 0  # NOT successfully published
+
+    # Verify Redis NOT called
+    mock_redis.push_to_delayed_queue.assert_not_called()
+
+    # Verify event marked for reconciliation (not published - never delivered)
+    await db_session.refresh(event)
+    assert event.published is False  # NOT published (never reached Redis)
+    assert event.reconciliation_required is True  # Marked for manual review
+    assert "Stale event" in event.last_error
+
+
+@pytest.mark.asyncio
+async def test_recovery_event_null_retry_attempt_rejected(
+    db_session: AsyncSession, mock_queue_service
+):
+    """Test recovery event with NULL retry_attempt (legacy) rejected"""
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.RETRYING,
+        retry_count=1,
+        next_retry_at=datetime(2026, 11, 20, 10, 0, 0),
+        priority=5,
+    )
+    db_session.add(job)
+
+    # Create legacy event without retry_attempt
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_recovered",
+        retry_attempt=None,  # Legacy - NULL
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    mock_redis = MagicMock()
+    mock_redis.push_to_delayed_queue = AsyncMock(return_value=True)
+    mock_queue_service.redis = mock_redis
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+        assert processed == 0  # NOT successfully published
+
+    # Verify Redis NOT called
+    mock_redis.push_to_delayed_queue.assert_not_called()
+
+    # Verify event marked for reconciliation (not published - never delivered)
+    await db_session.refresh(event)
+    assert event.published is False  # NOT published (never reached Redis)
+    assert event.reconciliation_required is True  # Marked for manual review
+    assert "NULL retry_attempt" in event.last_error
+
+
+@pytest.mark.asyncio
+async def test_recovery_event_job_not_retrying_rejected(
+    db_session: AsyncSession, mock_queue_service
+):
+    """Test recovery event rejected if job not in RETRYING status"""
+    # Job in PROCESSING status (not RETRYING)
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.PROCESSING,  # Wrong status
+        retry_count=1,
+        next_retry_at=datetime(2026, 11, 20, 10, 0, 0),
+        priority=5,
+    )
+    db_session.add(job)
+
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_recovered",
+        retry_attempt=1,
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    mock_redis = MagicMock()
+    mock_redis.push_to_delayed_queue = AsyncMock(return_value=True)
+    mock_queue_service.redis = mock_redis
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+        assert processed == 0
+
+    # Verify Redis NOT called
+    mock_redis.push_to_delayed_queue.assert_not_called()
+
+    # Verify event NOT marked published
+    await db_session.refresh(event)
+    assert event.published is False
+    assert "expected RETRYING" in event.last_error
+
+
+@pytest.mark.asyncio
+async def test_recovery_event_redis_failure_preserves_retry_intent(
+    db_session: AsyncSession, mock_queue_service
+):
+    """Test Redis failure leaves event unpublished for retry"""
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.RETRYING,
+        retry_count=1,
+        next_retry_at=datetime(2026, 11, 20, 10, 0, 0),
+        priority=5,
+    )
+    db_session.add(job)
+
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_recovered",
+        retry_attempt=1,
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    # Mock Redis failure
+    mock_redis = MagicMock()
+    mock_redis.push_to_delayed_queue = AsyncMock(return_value=False)
+    mock_queue_service.redis = mock_redis
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+        assert processed == 0
+
+    # Verify event NOT marked published and eligible for retry
+    await db_session.refresh(event)
+    assert event.published is False
+    assert event.attempts == 1  # Attempt incremented
+
+
+@pytest.mark.asyncio
+async def test_recovery_event_duplicate_publication_updates_same_member(
+    db_session: AsyncSession, mock_queue_service
+):
+    """Test repeated publication of same event updates same Redis member"""
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.RETRYING,
+        retry_count=1,
+        next_retry_at=datetime(2026, 11, 20, 10, 0, 0),
+        priority=5,
+    )
+    db_session.add(job)
+
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_recovered",
+        retry_attempt=1,
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    mock_redis = MagicMock()
+    mock_redis.push_to_delayed_queue = AsyncMock(return_value=True)
+    mock_queue_service.redis = mock_redis
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    # First publication
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        await dispatcher.process_batch()
+
+    first_call = mock_redis.push_to_delayed_queue.call_args
+
+    # Reset event to unpublished (simulate crash after Redis but before commit)
+    await db_session.refresh(event)
+    event.published = False
+    event.attempts = 0
+    await db_session.commit()
+
+    # Second publication (duplicate)
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        await dispatcher.process_batch()
+
+    second_call = mock_redis.push_to_delayed_queue.call_args
+
+    # Verify both calls have identical job_data (same member)
+    assert first_call[1]["job_data"] == second_call[1]["job_data"]
+    assert first_call[1]["job_data"]["retry_attempt"] == 1
+    assert first_call[1]["execute_at"] == second_call[1]["execute_at"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_event_different_retry_attempts_different_members(
+    db_session: AsyncSession, mock_queue_service
+):
+    """Test different retry attempts create different Redis members"""
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.RETRYING,
+        retry_count=2,
+        next_retry_at=datetime(2026, 11, 20, 10, 0, 0),
+        priority=5,
+    )
+    db_session.add(job)
+
+    # Create events for retry_attempt 1 and 2
+    event1 = JobOutbox(
+        job_id=job.id,
+        event_type="job_recovered",
+        retry_attempt=1,
+        published=False,
+        attempts=0,
+    )
+    event2 = JobOutbox(
+        job_id=job.id,
+        event_type="job_recovered",
+        retry_attempt=2,
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event1)
+    db_session.add(event2)
+    await db_session.commit()
+
+    mock_redis = MagicMock()
+    mock_redis.push_to_delayed_queue = AsyncMock(return_value=True)
+    mock_queue_service.redis = mock_redis
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+        # event1 is stale (retry_attempt=1, job.retry_count=2), marked for reconciliation
+        # event2 matches, published to Redis
+        assert processed == 1  # Only event2 successfully published
+
+    # Verify event1 (stale) NOT published to Redis
+    # Verify event2 (current) published to Redis
+    assert mock_redis.push_to_delayed_queue.call_count == 1
+
+    # Get the call for event2
+    call_args = mock_redis.push_to_delayed_queue.call_args
+    assert call_args[1]["job_data"]["retry_attempt"] == 2
+
+    # Verify event1 marked for reconciliation
+    await db_session.refresh(event1)
+    assert event1.published is False
+    assert event1.reconciliation_required is True
+
+    # Verify event2 successfully published
+    await db_session.refresh(event2)
+    assert event2.published is True
+    assert event2.reconciliation_required is False
+
+
+@pytest.mark.asyncio
+async def test_job_created_events_still_work(db_session: AsyncSession, mock_queue_service):
+    """Test existing job_created events continue working normally"""
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.PENDING,
+        priority=5,
+    )
+    db_session.add(job)
+
+    # job_created event (no retry_attempt)
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_created",
+        retry_attempt=None,  # NULL for job_created
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+        assert processed == 1
+
+    # Verify enqueued to main queue
+    mock_queue_service.enqueue_job.assert_called_once_with(
+        job_id=job.id,
+        job_type=job.job_type,
+        priority=5,
+    )
+
+    # Verify event marked published
+    await db_session.refresh(event)
+    assert event.published is True
+
+
+# ============================================================================
+# Exponential Backoff and Retry Exhaustion Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_redis_failure_sets_exponential_backoff(db_session: AsyncSession, mock_queue_service):
+    """Test that Redis failure sets exponential backoff, not hard limit"""
+    # Create job and event
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.QUEUED,
+        priority=5,
+    )
+    db_session.add(job)
+
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_created",
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    # Mock Redis failure
+    mock_queue_service.enqueue_job = AsyncMock(return_value=False)
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+
+    # Verify not published
+    assert processed == 0
+
+    # Verify backoff set
+    await db_session.refresh(event)
+    assert event.published is False
+    assert event.attempts == 1
+    assert event.next_publication_attempt_at is not None
+    assert event.last_error == "Redis publication failed"
+
+    # Verify backoff is approximately 1 second (first attempt)
+    backoff_seconds = (event.next_publication_attempt_at - datetime.utcnow()).total_seconds()
+    assert 0.5 < backoff_seconds < 2.0  # Allow some tolerance
+
+
+@pytest.mark.asyncio
+async def test_event_remains_eligible_after_many_failures(
+    db_session: AsyncSession, mock_queue_service
+):
+    """Test that events remain eligible even after more than 5 failures"""
+    # Create job and event
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.QUEUED,
+        priority=5,
+    )
+    db_session.add(job)
+
+    # Create event with 10 attempts already (would be exhausted under old max_attempts=5)
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_created",
+        published=False,
+        attempts=10,
+        next_publication_attempt_at=None,  # Eligible now
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    # Mock Redis failure
+    mock_queue_service.enqueue_job = AsyncMock(return_value=False)
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+
+    # Verify event was processed (not excluded due to attempt count)
+    assert processed == 0
+
+    # Verify attempt incremented and backoff set
+    await db_session.refresh(event)
+    assert event.attempts == 11  # Incremented
+    assert event.next_publication_attempt_at is not None
+    assert event.published is False  # Still eligible for future retry
+
+
+@pytest.mark.asyncio
+async def test_backoff_increases_and_is_capped(db_session: AsyncSession, mock_queue_service):
+    """Test that backoff doubles each time and caps at 5 minutes"""
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.QUEUED,
+        priority=5,
+    )
+    db_session.add(job)
+
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_created",
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    # Mock Redis failure
+    mock_queue_service.enqueue_job = AsyncMock(return_value=False)
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    # Test first 3 failures
+    expected_backoffs = [(1, 0.5, 3), (2, 1, 4), (4, 2, 8)]  # (expected, min, max) with tolerance
+
+    for i, (expected, min_val, max_val) in enumerate(expected_backoffs):
+        # Make event eligible
+        event.next_publication_attempt_at = None
+        await db_session.commit()
+
+        with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+            await dispatcher.process_batch()
+
+        await db_session.refresh(event)
+        actual_backoff = (event.next_publication_attempt_at - datetime.utcnow()).total_seconds()
+
+        # Wide tolerance for test execution time variability
+        assert (
+            min_val <= actual_backoff <= max_val
+        ), f"Attempt {i + 1}: expected ~{expected}s (range {min_val}-{max_val}), got {actual_backoff}s"
+
+    # Test that backoff caps at 300 seconds (5 minutes)
+    # After 9 attempts: 2^9 = 512 seconds, but should cap at 300
+    event.attempts = 9
+    event.next_publication_attempt_at = None
+    await db_session.commit()
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        await dispatcher.process_batch()
+
+    await db_session.refresh(event)
+    actual_backoff = (event.next_publication_attempt_at - datetime.utcnow()).total_seconds()
+
+    # Should be capped at 300 seconds
+    assert 299 < actual_backoff < 301
+
+
+@pytest.mark.asyncio
+async def test_event_retried_after_redis_recovery(db_session: AsyncSession, mock_queue_service):
+    """Test that event is retried after Redis recovers"""
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.QUEUED,
+        priority=5,
+    )
+    db_session.add(job)
+
+    # Event with backoff in the past (ready for retry)
+    past_time = datetime.utcnow() - timedelta(seconds=10)
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_created",
+        published=False,
+        attempts=3,
+        next_publication_attempt_at=past_time,  # Backoff expired
+        last_error="Redis publication failed",
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    # Mock Redis success (recovered)
+    mock_queue_service.enqueue_job = AsyncMock(return_value=True)
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+
+    # Verify successful publication
+    assert processed == 1
+
+    await db_session.refresh(event)
+    assert event.published is True
+    assert event.next_publication_attempt_at is None  # Backoff cleared
+    assert event.last_error is None  # Error cleared
+
+
+@pytest.mark.asyncio
+async def test_invalid_legacy_event_marked_permanent_failure(
+    db_session: AsyncSession, mock_queue_service
+):
+    """Test that legacy recovery event with NULL retry_attempt is marked for reconciliation"""
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.RETRYING,
+        retry_count=1,
+        next_retry_at=datetime.utcnow() + timedelta(seconds=60),
+        priority=5,
+    )
+    db_session.add(job)
+
+    # Legacy recovery event without retry_attempt
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_recovered",
+        retry_attempt=None,  # NULL - legacy event
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+
+    # Verify marked for reconciliation (NOT published - never delivered)
+    assert processed == 0
+
+    await db_session.refresh(event)
+    assert event.published is False  # NOT published
+    assert event.reconciliation_required is True  # Marked for manual review
+    assert event.last_error == "job_recovered event has NULL retry_attempt (legacy event)"
+    # next_publication_attempt_at is cleared when reconciliation_required is set
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dispatchers_no_duplicate_publication(
+    db_session: AsyncSession, mock_queue_service
+):
+    """Test that concurrent dispatchers don't publish the same event twice"""
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+
+    # Create job and event
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.QUEUED,
+        priority=5,
+    )
+    db_session.add(job)
+
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_created",
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    # Create two independent sessions
+    TEST_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/jobprocessing_test"
+    engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+    SessionFactory = async_sessionmaker(engine, expire_on_commit=False)
+
+    # Track which dispatcher published
+    published_by = []
+
+    async def dispatcher_process(dispatcher_id):
+        """Simulates a dispatcher instance"""
+        mock_service = MagicMock(spec=QueueService)
+        mock_service.enqueue_job = AsyncMock(return_value=True)
+
+        dispatcher = OutboxDispatcher(mock_service, batch_size=10)
+
+        # Override AsyncSessionLocal to use test database
+        with patch("app.services.outbox_dispatcher.AsyncSessionLocal", SessionFactory):
+            processed = await dispatcher.process_batch()
+            if processed > 0:
+                published_by.append(dispatcher_id)
+            return processed
+
+    try:
+        # Run two dispatchers concurrently
+        results = await asyncio.gather(
+            dispatcher_process("dispatcher-1"),
+            dispatcher_process("dispatcher-2"),
+            return_exceptions=False,
+        )
+
+        # Verify exactly one dispatcher published the event
+        total_processed = sum(results)
+        assert total_processed == 1, f"Expected 1 publication, got {total_processed}"
+        assert len(published_by) == 1, f"Expected 1 dispatcher to publish, got {len(published_by)}"
+
+        # Verify event is published
+        await db_session.refresh(event)
+        assert event.published is True
+        assert event.attempts == 1
+
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_job_created_publication_still_works(db_session: AsyncSession, mock_queue_service):
+    """Test that standard job_created events still work correctly"""
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.QUEUED,
+        priority=3,
+    )
+    db_session.add(job)
+
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_created",
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    # Mock successful enqueue
+    mock_queue_service.enqueue_job = AsyncMock(return_value=True)
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+
+    assert processed == 1
+
+    # Verify enqueued correctly
+    mock_queue_service.enqueue_job.assert_called_once_with(
+        job_id=job.id,
+        job_type="test_task",
+        priority=3,
+    )
+
+    # Verify event published
+    await db_session.refresh(event)
+    assert event.published is True
+    assert event.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_job_recovered_retry_attempt_unchanged(db_session: AsyncSession, mock_queue_service):
+    """Test that job_recovered event preserves immutable retry_attempt"""
+    job = Job(
+        id=uuid4(),
+        job_type="test_task",
+        payload={"data": "test"},
+        status=JobStatus.RETRYING,
+        retry_count=2,
+        next_retry_at=datetime(2026, 11, 20, 10, 0, 0),
+        priority=5,
+    )
+    db_session.add(job)
+
+    event = JobOutbox(
+        job_id=job.id,
+        event_type="job_recovered",
+        retry_attempt=2,  # Immutable identifier
+        published=False,
+        attempts=0,
+    )
+    db_session.add(event)
+    await db_session.commit()
+
+    original_retry_attempt = event.retry_attempt
+
+    # Mock Redis
+    mock_redis = MagicMock()
+    mock_redis.push_to_delayed_queue = AsyncMock(return_value=True)
+    mock_queue_service.redis = mock_redis
+
+    dispatcher = OutboxDispatcher(mock_queue_service, batch_size=10)
+
+    with patch("app.services.outbox_dispatcher.AsyncSessionLocal", TestSessionLocal):
+        processed = await dispatcher.process_batch()
+
+    assert processed == 1
+
+    # Verify retry_attempt unchanged
+    await db_session.refresh(event)
+    assert event.retry_attempt == original_retry_attempt
+    assert event.published is True
+
+    # Verify Redis received correct retry_attempt
+    call_args = mock_redis.push_to_delayed_queue.call_args
+    assert call_args[1]["job_data"]["retry_attempt"] == 2

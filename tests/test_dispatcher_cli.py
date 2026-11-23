@@ -33,14 +33,12 @@ async def test_dispatcher_runner_initialization():
         dispatcher_id="test-dispatcher",
         batch_size=20,
         poll_interval=2.0,
-        max_attempts=3,
         shutdown_timeout=10.0,
     )
 
     assert runner.dispatcher_id == "test-dispatcher"
     assert runner.batch_size == 20
     assert runner.poll_interval == 2.0
-    assert runner.max_attempts == 3
     assert runner.shutdown_timeout == 10.0
     assert runner.dispatcher is None
     assert runner.queue_service is None
@@ -56,7 +54,6 @@ async def test_dispatcher_runner_starts_and_runs(mock_queue_service, mock_dispat
         dispatcher_id="test-dispatcher",
         batch_size=10,
         poll_interval=1.0,
-        max_attempts=5,
         shutdown_timeout=5.0,
     )
 
@@ -108,7 +105,6 @@ async def test_dispatcher_runner_starts_and_runs(mock_queue_service, mock_dispat
         queue_service=mock_queue_service,
         batch_size=10,
         poll_interval_seconds=1.0,
-        max_attempts=5,
     )
 
     # Verify cleanup
@@ -123,7 +119,6 @@ async def test_dispatcher_runner_handles_sigterm(mock_queue_service, mock_dispat
         dispatcher_id="test-dispatcher",
         batch_size=10,
         poll_interval=1.0,
-        max_attempts=5,
         shutdown_timeout=5.0,
     )
 
@@ -178,7 +173,6 @@ async def test_dispatcher_runner_handles_sigint(mock_queue_service, mock_dispatc
         dispatcher_id="test-dispatcher",
         batch_size=10,
         poll_interval=1.0,
-        max_attempts=5,
         shutdown_timeout=5.0,
     )
 
@@ -233,7 +227,6 @@ async def test_dispatcher_runner_handles_dispatcher_exception(mock_queue_service
         dispatcher_id="test-dispatcher",
         batch_size=10,
         poll_interval=1.0,
-        max_attempts=5,
         shutdown_timeout=5.0,
     )
 
@@ -264,7 +257,6 @@ async def test_dispatcher_runner_detects_unexpected_exit(mock_queue_service, moc
         dispatcher_id="test-dispatcher",
         batch_size=10,
         poll_interval=1.0,
-        max_attempts=5,
         shutdown_timeout=5.0,
     )
 
@@ -301,7 +293,6 @@ async def test_dispatcher_runner_cleanup_bounded_timeout_on_stop(
         dispatcher_id="test-dispatcher",
         batch_size=10,
         poll_interval=1.0,
-        max_attempts=5,
         shutdown_timeout=0.5,
     )
 
@@ -354,7 +345,6 @@ async def test_dispatcher_runner_does_not_cancel_task_during_graceful_shutdown(
         dispatcher_id="test-dispatcher",
         batch_size=10,
         poll_interval=1.0,
-        max_attempts=5,
         shutdown_timeout=5.0,
     )
 
@@ -424,7 +414,6 @@ async def test_dispatcher_runner_cancels_task_only_on_timeout(mock_queue_service
         dispatcher_id="test-dispatcher",
         batch_size=10,
         poll_interval=1.0,
-        max_attempts=5,
         shutdown_timeout=0.3,
     )
 
@@ -480,7 +469,6 @@ async def test_dispatcher_runner_handles_queue_service_initialization_failure():
         dispatcher_id="test-dispatcher",
         batch_size=10,
         poll_interval=1.0,
-        max_attempts=5,
         shutdown_timeout=5.0,
     )
 
@@ -507,7 +495,6 @@ async def test_dispatcher_runner_shutdown_event_coordination(mock_queue_service,
         dispatcher_id="test-dispatcher",
         batch_size=10,
         poll_interval=1.0,
-        max_attempts=5,
         shutdown_timeout=5.0,
     )
 
@@ -615,7 +602,6 @@ async def test_dispatcher_runner_passes_all_parameters(mock_queue_service):
         queue_service=mock_queue_service,
         batch_size=25,
         poll_interval_seconds=3.5,
-        max_attempts=7,
     )
 
 
@@ -626,7 +612,6 @@ async def test_dispatcher_runner_stop_error_sets_exit_code(mock_queue_service, m
         dispatcher_id="test-dispatcher",
         batch_size=10,
         poll_interval=1.0,
-        max_attempts=5,
         shutdown_timeout=5.0,
     )
 

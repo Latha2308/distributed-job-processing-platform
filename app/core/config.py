@@ -66,6 +66,17 @@ class Settings(BaseSettings):
     JOB_TIMEOUT: int = 300  # 5 minutes
     MAX_JOB_AGE_DAYS: int = 30
 
+    # Job Recovery Configuration (PROCESSING jobs)
+    JOB_RECOVERY_INTERVAL: int = 60  # Check for stuck jobs every 60 seconds
+    JOB_RECOVERY_BATCH_SIZE: int = 10  # Process up to 10 stuck jobs per batch
+    JOB_RECOVERY_SAFETY_BUFFER: int = 10  # Grace period beyond timeout (seconds)
+
+    # QUEUED Job Reconciliation Configuration (Step 289D)
+    QUEUED_RECONCILIATION_ENABLED: bool = True  # Enable/disable QUEUED reconciliation
+    QUEUED_RECONCILIATION_BATCH_SIZE: int = 10  # Process up to 10 QUEUED jobs per batch
+    QUEUED_RECONCILIATION_AGE_THRESHOLD_MINUTES: int = 10  # Min age for first recovery
+    QUEUED_RECONCILIATION_THROTTLE_HOURS: int = 1  # Min interval between recovery attempts
+
     # Logging
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "json"

@@ -116,9 +116,10 @@ class Worker:
                     continue
 
                 job_id = UUID(message["job_id"])
+                retry_attempt = message.get("retry_attempt")  # Extract retry_attempt if present
 
                 # Process the job
-                await self._process_job(job_id)
+                await self._process_job(job_id, retry_attempt)
 
             except asyncio.CancelledError:
                 logger.info("worker_cancelled", worker_id=self.worker_id)
@@ -132,8 +133,13 @@ class Worker:
                 )
                 await asyncio.sleep(1)
 
-    async def _process_job(self, job_id: UUID):
-        """Process a single job"""
+    async def _process_job(self, job_id: UUID, retry_attempt: Optional[int] = None):
+        """Process a single job
+
+        Args:
+            job_id: Job ID to process
+            retry_attempt: Expected retry attempt number (for recovered jobs)
+        """
         self.current_job_id = job_id
         start_time = datetime.utcnow()
 
@@ -146,7 +152,8 @@ class Worker:
 
                 # Atomically claim the job for this worker
                 # This prevents race conditions where multiple workers process the same job
-                job = await job_service.claim_job(job_id, self.worker_id)
+                # For recovered jobs, also validates retry_attempt matches job.retry_count
+                job = await job_service.claim_job(job_id, self.worker_id, retry_attempt)
 
                 if not job:
                     # Job claim failed - either not in eligible state or already claimed
@@ -158,6 +165,12 @@ class Worker:
                     )
                     return
 
+                # Capture execution generation at claim time
+                # This value represents this execution's ownership generation
+                # It must not be re-read before completion to prevent stale execution
+                # from adopting a newer generation
+                execution_retry_count = job.retry_count
+
                 # Commit the claim before executing the job
                 # This ensures the job is marked as PROCESSING in the database
                 await db.commit()
@@ -167,6 +180,7 @@ class Worker:
                     job_id=str(job_id),
                     job_type=job.job_type,
                     worker_id=self.worker_id,
+                    execution_retry_count=execution_retry_count,
                 )
 
                 # Execute the job with timeout
@@ -188,6 +202,7 @@ class Worker:
                         worker_id=self.worker_id,
                         expected_status=JobStatus.PROCESSING,
                         expected_worker_id=self.worker_id,
+                        expected_retry_count=execution_retry_count,
                     )
 
                     # Check if fenced update succeeded
@@ -198,7 +213,8 @@ class Worker:
                             "job_completion_fencing_rejected",
                             job_id=str(job_id),
                             worker_id=self.worker_id,
-                            reason="Job state changed before worker could complete (likely recovered)",
+                            execution_retry_count=execution_retry_count,
+                            reason="Job state changed or execution generation advanced before worker could complete",
                         )
                         return
 
@@ -244,6 +260,7 @@ class Worker:
                         worker_id=self.worker_id,
                         expected_status=JobStatus.PROCESSING,
                         expected_worker_id=self.worker_id,
+                        expected_retry_count=execution_retry_count,
                     )
 
                     # Check if fenced update succeeded
@@ -254,7 +271,8 @@ class Worker:
                             "job_timeout_fencing_rejected",
                             job_id=str(job_id),
                             worker_id=self.worker_id,
-                            reason="Job state changed before worker could mark timeout (likely recovered)",
+                            execution_retry_count=execution_retry_count,
+                            reason="Job state changed or execution generation advanced before worker could mark timeout",
                         )
                         return
 
@@ -289,6 +307,7 @@ class Worker:
                         worker_id=self.worker_id,
                         expected_status=JobStatus.PROCESSING,
                         expected_worker_id=self.worker_id,
+                        expected_retry_count=execution_retry_count,
                     )
 
                     # Check if fenced update succeeded
@@ -299,7 +318,8 @@ class Worker:
                             "job_failure_fencing_rejected",
                             job_id=str(job_id),
                             worker_id=self.worker_id,
-                            reason="Job state changed before worker could mark failure (likely recovered)",
+                            execution_retry_count=execution_retry_count,
+                            reason="Job state changed or execution generation advanced before worker could mark failure",
                         )
                         return
 

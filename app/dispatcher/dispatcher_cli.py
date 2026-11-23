@@ -68,8 +68,7 @@ class DispatcherRunner:
 
         logger.info(
             f"Starting outbox dispatcher: {self.dispatcher_id} "
-            f"(batch_size={self.batch_size}, poll_interval={self.poll_interval}s, "
-            f"max_attempts={self.max_attempts})"
+            f"(batch_size={self.batch_size}, poll_interval={self.poll_interval}s)"
         )
 
         try:
@@ -81,7 +80,6 @@ class DispatcherRunner:
                 queue_service=self.queue_service,
                 batch_size=self.batch_size,
                 poll_interval_seconds=self.poll_interval,
-                max_attempts=self.max_attempts,
             )
 
             # Start dispatcher in background task

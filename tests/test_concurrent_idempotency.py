@@ -28,7 +28,7 @@ import pytest_asyncio
 from sqlalchemy import select
 from unittest.mock import MagicMock, AsyncMock
 
-from app.core.database import Base
+from app.db.base import Base
 from app.db.models import Job, JobOutbox, JobStatus
 from app.models.job import JobCreate
 from app.services.job_service import JobService

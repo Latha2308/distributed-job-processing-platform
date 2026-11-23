@@ -3,11 +3,11 @@
 from typing import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
+from app.db.base import Base  # Import Base from engine-independent module
 
-# Create async engine
+# Create async engine - always initialized when this module is imported
 engine = create_async_engine(
     str(settings.DATABASE_URL),
     echo=settings.DB_ECHO,
@@ -24,13 +24,6 @@ AsyncSessionLocal = async_sessionmaker(
     autocommit=False,
     autoflush=False,
 )
-
-
-# Create declarative base for SQLAlchemy 2.0 typed mappings
-class Base(DeclarativeBase):
-    """Base class for all ORM models with type support"""
-
-    pass
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
