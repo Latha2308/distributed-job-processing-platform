@@ -294,7 +294,7 @@ distributed-job-processing-platform/
 
 3. **Start all services**
    ```bash
-   docker compose up -d
+   docker-compose up -d
    ```
    
    This starts **8 services**:
@@ -307,18 +307,18 @@ distributed-job-processing-platform/
 
 4. **Verify services are running**
    ```bash
-   docker compose ps
+   docker-compose ps
    curl http://localhost:8000/health
    ```
 
 5. **View logs**
    ```bash
    # All services
-   docker compose logs -f
+   docker-compose logs -f
 
    # Specific service
-   docker compose logs -f dispatcher
-   docker compose logs -f worker1
+   docker-compose logs -f dispatcher
+   docker-compose logs -f worker1
    ```
 
 6. **Access the application**
@@ -329,7 +329,7 @@ distributed-job-processing-platform/
 
 7. **Run database migrations**
    ```bash
-   docker compose exec api alembic upgrade head
+   docker-compose exec api alembic upgrade head
    ```
 
 ### Manual Setup (Development)
@@ -349,7 +349,7 @@ For local development without Docker:
 
 3. **Start infrastructure services**
    ```bash
-   docker compose up -d postgres redis prometheus
+   docker-compose up -d postgres redis prometheus
    ```
 
 4. **Configure environment**
@@ -933,15 +933,15 @@ View logs from all services:
 
 ```bash
 # All services
-docker compose logs -f
+docker-compose logs -f
 
 # Specific service
-docker compose logs -f api
-docker compose logs -f dispatcher
-docker compose logs -f worker1
+docker-compose logs -f api
+docker-compose logs -f dispatcher
+docker-compose logs -f worker1
 
 # Last 100 lines
-docker compose logs --tail=100 api
+docker-compose logs --tail=100 api
 ```
 
 Logs are structured JSON for easy parsing:
@@ -965,19 +965,19 @@ The recommended approach for local development and testing:
 
 ```bash
 # Start all services
-docker compose up -d
+docker-compose up -d
 
 # View logs
-docker compose logs -f
+docker-compose logs -f
 
 # Stop all services
-docker compose down
+docker-compose down
 
 # Rebuild and restart
-docker compose up -d --build
+docker-compose up -d --build
 
 # Remove volumes (clean slate)
-docker compose down -v
+docker-compose down -v
 ```
 
 ### AWS ECS (Not Production-Validated)
@@ -1014,27 +1014,27 @@ The codebase includes AWS-related configuration, but production deployment has n
 
 ```bash
 # Check logs
-docker compose logs
+docker-compose logs
 
 # Check service status
-docker compose ps
+docker-compose ps
 
 # Rebuild images
-docker compose down
-docker compose up -d --build
+docker-compose down
+docker-compose up -d --build
 ```
 
 #### Database connection errors
 
 ```bash
 # Verify PostgreSQL is running
-docker compose ps postgres
+docker-compose ps postgres
 
 # Check PostgreSQL logs
-docker compose logs postgres
+docker-compose logs postgres
 
 # Test connection
-docker compose exec postgres psql -U postgres -c "SELECT version();"
+docker-compose exec postgres psql -U postgres -c "SELECT version();"
 
 # Verify DATABASE_URL in .env matches docker-compose configuration
 ```
@@ -1043,33 +1043,33 @@ docker compose exec postgres psql -U postgres -c "SELECT version();"
 
 ```bash
 # Check dispatcher logs
-docker compose logs dispatcher
+docker-compose logs dispatcher
 
 # Verify outbox events exist
-docker compose exec postgres psql -U postgres -d jobprocessing \
+docker-compose exec postgres psql -U postgres -d jobprocessing \
   -c "SELECT * FROM job_outbox WHERE published = false LIMIT 10;"
 
 # Check Redis connectivity
-docker compose exec redis redis-cli ping
+docker-compose exec redis redis-cli ping
 
 # Restart dispatcher
-docker compose restart dispatcher
+docker-compose restart dispatcher
 ```
 
 #### Workers not processing jobs
 
 ```bash
 # Check worker logs
-docker compose logs worker1 worker2 worker3
+docker-compose logs worker1 worker2 worker3
 
 # Verify Redis queue depth
-docker compose exec redis redis-cli ZCARD job_queue
+docker-compose exec redis redis-cli ZCARD job_queue
 
 # Check Redis connectivity from worker
-docker compose exec worker1 python -c "import redis; r = redis.from_url('redis://redis:6379/0'); print(r.ping())"
+docker-compose exec worker1 python -c "import redis; r = redis.from_url('redis://redis:6379/0'); print(r.ping())"
 
 # Restart workers
-docker compose restart worker1 worker2 worker3
+docker-compose restart worker1 worker2 worker3
 ```
 
 #### Port conflicts
@@ -1092,8 +1092,8 @@ This was a known issue that has been fixed. Ensure you have the latest code:
 
 ```bash
 git pull origin main
-docker compose down
-docker compose up -d --build
+docker-compose down
+docker-compose up -d --build
 ```
 
 #### Jobs stuck in "processing" status
@@ -1102,14 +1102,14 @@ This indicates a worker crashed during execution:
 
 ```bash
 # Check worker logs for errors
-docker compose logs worker1 worker2 worker3
+docker-compose logs worker1 worker2 worker3
 
 # Manually update job status (if needed)
-docker compose exec postgres psql -U postgres -d jobprocessing \
+docker-compose exec postgres psql -U postgres -d jobprocessing \
   -c "UPDATE jobs SET status = 'failed' WHERE status = 'processing' AND updated_at < NOW() - INTERVAL '10 minutes';"
 
 # Restart workers
-docker compose restart worker1 worker2 worker3
+docker-compose restart worker1 worker2 worker3
 ```
 
 ### Getting Help
