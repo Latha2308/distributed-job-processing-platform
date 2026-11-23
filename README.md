@@ -67,7 +67,7 @@ The system processes six simulated job types (data processing, email notificatio
 ### Technical Highlights
 
 - **PostgreSQL FOR UPDATE SKIP LOCKED** for safe concurrent outbox polling
-- **Redis ZADD priority scoring** for priority queue implementation
+- **Redis sorted sets (ZADD/ZPOPMIN)** for priority queue implementation
 - **Async/await throughout** using Python's asyncio
 - **Type safety** with Pydantic models and comprehensive type hints
 - **Connection pooling** for PostgreSQL and Redis
@@ -96,9 +96,9 @@ graph TB
     DB -->|Poll unpublished| Dispatcher
     Dispatcher -->|Publish to queue| Queue
     Dispatcher -->|Mark published| DB
-    Queue -->|BLPOP priority| W1
-    Queue -->|BLPOP priority| W2
-    Queue -->|BLPOP priority| W3
+    Queue -->|ZPOPMIN priority| W1
+    Queue -->|ZPOPMIN priority| W2
+    Queue -->|ZPOPMIN priority| W3
     W1 & W2 & W3 -->|UPDATE with fencing| DB
     Recovery -->|Scan stuck jobs| DB
     Recovery -->|Re-enqueue| Queue
@@ -127,25 +127,26 @@ API → Client: 201 Created {job_id, status: "queued"}
 Dispatcher polls: SELECT ... FROM job_outbox
                   WHERE published_at IS NULL
                   FOR UPDATE SKIP LOCKED LIMIT 10
-Dispatcher → Redis: ZADD queue {priority} {job_id}
+Dispatcher → Redis: ZADD queue {job_id} {priority}
 Dispatcher → PostgreSQL: UPDATE job_outbox SET published_at = NOW()
 ```
 
 **3. Worker Execution**
 ```
-Worker → Redis: BLPOP queue (blocking, priority-ordered)
+Worker → Redis: ZPOPMIN queue (atomic pop with lowest priority score)
 Worker → PostgreSQL: UPDATE jobs SET status='processing', worker_id='worker-1'
-                     WHERE id = ? AND status = 'queued'  -- Atomic claim
+                     WHERE id = ? AND status = 'queued'
+                     AND retry_count = ?  -- Fencing via retry_attempt validation
 Worker executes job handler
 Worker → PostgreSQL: UPDATE jobs SET status='completed', result=?
-                     WHERE id = ? AND worker_id = 'worker-1'  -- Fencing
+                     WHERE id = ? AND worker_id = 'worker-1'
 ```
 
 **4. Failure & Retry**
 ```
 On failure:
 Worker → PostgreSQL: UPDATE jobs SET status='retrying', retry_count=retry_count+1
-Worker → Redis: ZADD queue {priority} {job_id, retry_attempt}
+Worker → Redis: ZADD queue {job_id} {priority}
 
 On exhaustion (retry_count >= max_retries):
 Worker → PostgreSQL: UPDATE jobs SET status='dead_letter', is_dead_letter=true
@@ -160,7 +161,7 @@ The outbox pattern solves the dual-write problem by making job delivery a two-ph
 **Phase 1: Atomic Persistence**
 - Job record and outbox event are written in a single PostgreSQL transaction
 - If the transaction fails, nothing is committed
-- If the transaction succeeds, delivery is guaranteed
+- If the transaction succeeds, the outbox event is durably persisted
 
 **Phase 2: Async Publishing**
 - Separate dispatcher process polls unpublished outbox events
@@ -169,7 +170,7 @@ The outbox pattern solves the dual-write problem by making job delivery a two-ph
 - If dispatcher crashes, unpublished events remain in database for retry
 
 **Delivery Semantics:**
-- **At-Least-Once** - Jobs may be published multiple times if dispatcher crashes after Redis publish but before marking as published
+- **At-Least-Once** - Jobs may be published multiple times if dispatcher crashes after Redis publish but before marking as published in the outbox
 - **Idempotency Required** - Job handlers must handle duplicate executions safely
 
 #### Worker Fencing
@@ -177,12 +178,13 @@ The outbox pattern solves the dual-write problem by making job delivery a two-ph
 Fencing prevents race conditions when multiple workers process the same job:
 
 ```python
-# Worker claims job
+# Pseudocode - Atomic job claiming
 UPDATE jobs
 SET status = 'processing', worker_id = 'worker-1', started_at = NOW()
-WHERE id = ? AND status = 'queued'  -- Atomic claim
+WHERE id = ? AND status IN ('queued', 'retrying')
+  AND retry_count = ?  -- Fencing: must match expected retry_attempt
 
-# Worker completes with fencing
+# Pseudocode - Worker completes with fencing
 UPDATE jobs
 SET status = 'completed', result = ?, completed_at = NOW()
 WHERE id = ? AND worker_id = 'worker-1' AND status = 'processing'
@@ -190,11 +192,11 @@ WHERE id = ? AND worker_id = 'worker-1' AND status = 'processing'
 ```
 
 **Scenario:**
-1. Worker 1 claims job, starts processing
+1. Worker 1 claims job with retry_count=0, starts processing
 2. Worker 1 appears stuck (network issue, long GC pause)
-3. Recovery detects timeout, re-enqueues with new retry_attempt
-4. Worker 2 claims job with retry_attempt=1
-5. Worker 1 finally completes → UPDATE fails (retry_attempt mismatch)
+3. Recovery detects timeout, increments retry_count to 1, re-queues job
+4. Worker 2 claims job (retry_count=1 required), starts processing
+5. Worker 1 finally completes → UPDATE fails (retry_count changed from 0 to 1)
 6. Worker 2's completion succeeds
 
 #### Job Recovery
@@ -211,8 +213,8 @@ WHERE status = 'processing'
 # Creates recovery event in outbox
 INSERT INTO job_outbox (job_id, event_type='job_recovered', retry_attempt=...)
 
-# Dispatcher publishes to queue with retry_attempt
-# Workers validate retry_attempt before claiming
+# Dispatcher publishes to queue
+# Workers validate retry_attempt matches job.retry_count before claiming
 ```
 
 ## Technology Stack
@@ -455,7 +457,7 @@ ws.send('refresh');
 
 ### Test Suite
 
-**Results**: 345 tests passed, 0 failed (verified November 2024)
+**Results**: 345 tests passed, 0 failed (verified November 23, 2026)
 
 The test suite covers:
 - Atomic job claiming (33 tests)
@@ -521,8 +523,8 @@ Access Prometheus at http://localhost:9090
 # Job completion rate (jobs/second)
 rate(job_completions_total[5m])
 
-# Average processing time
-avg(job_processing_duration_seconds)
+# Average processing time for histograms
+rate(job_processing_duration_seconds_sum[5m]) / rate(job_processing_duration_seconds_count[5m])
 
 # Success rate percentage
 100 * (
