@@ -64,6 +64,16 @@ docker-compose.override.yml
 # AWS
 .aws/
 
+# Terraform
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+terraform.tfvars
+*.auto.tfvars
+.terraform/
+.terraform.lock.hcl
+*.tfplan
+
 # MacOS
 .DS_Store
 

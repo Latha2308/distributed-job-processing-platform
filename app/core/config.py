@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     SQS_DLQ_URL: Optional[str] = None
     USE_SQS: bool = False  # Enable SQS when configured
 
+    # CORS Configuration
+    CORS_ORIGINS: list[str] = Field(
+        default=["http://localhost:3000", "http://localhost:8000"],
+        description="Allowed CORS origins. Use ['*'] for development only.",
+    )
+
     # Worker Configuration
     WORKER_COUNT: int = 3
     WORKER_PREFETCH_COUNT: int = 5

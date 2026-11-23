@@ -1,0 +1,40 @@
+# Terraform State Files
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Terraform Variable Files (may contain secrets)
+terraform.tfvars
+*.auto.tfvars
+
+# Terraform lock file (optional - some teams commit this)
+# .terraform.lock.hcl
+
+# Terraform modules
+.terraform/
+.terraform.lock.hcl
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Sensitive data files
+*.pem
+*.key
+*.crt
+
+# CLI configuration
+.terraformrc
+terraform.rc
+
+# Plans
+*.tfplan
+
+# Backup files
+*.bak

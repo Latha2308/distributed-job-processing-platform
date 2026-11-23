@@ -1,0 +1,38 @@
+# Terraform Variables - Copy this file to terraform.tfvars and customize
+
+# AWS Configuration
+aws_region   = "us-east-1"
+project_name = "job-processing"
+environment  = "prod"
+
+# Cost Optimization
+enable_nat_gateway = false # Set to true only if ECS tasks need private subnets
+worker_count       = 2     # Adjust based on workload
+
+# Database
+db_instance_class = "db.t4g.micro" # ARM-based, cheapest option
+db_multi_az       = false          # Set to true for production HA (doubles cost)
+
+# Application Secrets (REQUIRED)
+secret_key = "REPLACE_WITH_64_CHAR_RANDOM_STRING_GENERATE_WITH_openssl_rand_base64_48"
+
+# HTTPS Configuration (optional, recommended for production)
+# PREREQUISITES:
+# 1. Register a domain name (e.g., via Route53, GoDaddy, etc.)
+# 2. Request an ACM certificate in AWS Certificate Manager for your domain
+# 3. Validate the certificate (DNS or email validation)
+# 4. Create a Route53 alias record pointing your domain to the ALB DNS name
+enable_https        = false # Set to true only after completing prerequisites above
+domain_name         = ""    # e.g., "api.example.com" (must match ACM certificate)
+acm_certificate_arn = ""    # ACM certificate ARN (e.g., arn:aws:acm:us-east-1:123456789:certificate/xxx)
+
+# IMPORTANT: HTTP-only configuration (enable_https = false) is NOT production-secure
+# API traffic will be unencrypted. Use only for development/testing.
+
+# Tags
+tags = {
+  Project     = "job-processing"
+  ManagedBy   = "terraform"
+  Environment = "prod"
+  Owner       = "your-team"
+}
